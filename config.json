@@ -1,0 +1,22 @@
+{
+  "trademe_api_key": "PASTE_YOUR_TRADEME_CONSUMER_KEY_HERE",
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "sites": {
+    "thorntons": true,
+    "turners": true,
+    "mainland_auctions": true
+  },
+  "watch_categories": {
+    "Electronics & Tech": ["electronics", "tech", "bluetooth", "wireless", "camera", "speaker", "console", "gaming"],
+    "Tools & DIY": ["power tool", "tools", "workshop", "DIY"],
+    "Toys & Kids": ["toys", "kids", "STEM"],
+    "Mobility & Bikes": ["e-scooter", "e-bike", "bike", "scooter"],
+    "Phones, Watches & Jewellery": ["phone", "watch", "jewellery"],
+    "Appliances & Whiteware": ["appliance", "whiteware", "kitchen"],
+    "General Clearance Signals": ["brand new", "new stock", "clearance", "unreserved", "liquidation"]
+  },
+  "min_trademe_comparables": 3,
+  "request_delay_seconds": 2.0,
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NZ-Reseller-Scanner/1.0 (personal use, low volume)"
+}
