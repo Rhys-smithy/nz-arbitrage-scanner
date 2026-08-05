@@ -91,7 +91,7 @@ def score_group(items: List[Dict], api_key: str) -> List[Dict]:
             },
             json={
                 "model": MODEL,
-                "max_tokens": 800,
+                "max_tokens": 1500,
                 "system": SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": json.dumps(payload_items)}],
             },
@@ -103,9 +103,10 @@ def score_group(items: List[Dict], api_key: str) -> List[Dict]:
 
         data = resp.json()
         text_blocks = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
-        parsed = _extract_json("".join(text_blocks))
+        raw_text = "".join(text_blocks)
+        parsed = _extract_json(raw_text)
         if not parsed or len(parsed) != len(items):
-            print(f"[ai_value] response length mismatch or unparseable, got: {parsed}")
+            print(f"[ai_value] response length mismatch or unparseable (expected {len(items)} items). Raw response: {raw_text[:500]}")
             return fallback
 
         results = []
