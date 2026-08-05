@@ -93,12 +93,12 @@ def fetch_category_items(slug: str, user_agent: str) -> List[Dict]:
         item_id = match.group(1)
         if item_id in seen_ids:
             continue
-        seen_ids.add(item_id)
 
         item_url = href if href.startswith("http") else BASE_URL + href
         title = link.get("title") or link.get_text(strip=True)
         if not title:
             continue
+        seen_ids.add(item_id)
 
         container = link.find_parent(["div", "li", "article"]) or link.parent
         # Walk up a couple more levels if the immediate parent is too small
