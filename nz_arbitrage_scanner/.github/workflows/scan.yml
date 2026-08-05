@@ -1,0 +1,49 @@
+name: NZ Auction Scanner
+
+on:
+  schedule:
+    # Runs at 18:00 UTC = 6am NZST / 7am NZDT. GitHub Actions cron doesn't
+    # follow DST, so expect the notification to land an hour later during
+    # NZ daylight saving (roughly late Sept - early Apr) -- adjust the
+    # cron string then if the timing bugs you.
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}   # <-- lets you trigger a run manually from the
+                          #     GitHub mobile app: Actions tab > this
+                          #     workflow > "Run workflow"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore seen-listings cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: seen-cache-${{ github.run_id }}
+          restore-keys: |
+            seen-cache-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
+
+      - name: Upload CSV report as an artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opportunity-report-${{ github.run_id }}
+          path: reports/*.csv
+          if-no-files-found: ignore
+          retention-days: 30
