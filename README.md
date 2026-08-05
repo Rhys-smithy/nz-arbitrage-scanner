@@ -111,6 +111,20 @@ first.
 Thorntons/Mainland scraper returns 0, the site likely changed its page
 structure -- check the relevant file in `scanner/scrapers/`.
 
+## The spreadsheet report
+
+Alongside the CSV, every run also generates an `.xlsx` version with **live
+formulas** — one row per opportunity, plus editable assumption cells at the
+top (buyer's premium %, marketplace fee %, listing/postage cost). Change an
+assumption once and every row's landed cost / net resale / profit
+recalculates automatically. This is the same math as a standalone
+landed-cost calculator, just applied across every opportunity in one sheet
+instead of one item at a time.
+
+It's delivered straight to your Telegram chat as a file attachment (not
+just linked) so you don't need to dig through GitHub Actions artifacts to
+get it — look for the document alongside the text summary each run.
+
 ## Reading the report
 
 - `data_basis` — "Real price + condition" (Turners) vs "Listing language
@@ -122,9 +136,18 @@ structure -- check the relevant file in `scanner/scrapers/`.
 - `buy_now_price_nzd` — set when a listing has an instant Buy Now option
   (common on vehicle listings, occasional on General Goods) instead of or
   alongside a bid price.
-- `value_vs_new_pct` — roughly how far below Claude's estimated new price
+- `suggested_resale_price_nzd` / `potential_profit_nzd` / `potential_profit_pct` —
+  Claude's estimate of what this specific item (in its actual condition) would
+  sell for secondhand on Trade Me/Facebook Marketplace NZ, and the resulting
+  gross margin against the current auction price. **This is a starting
+  estimate, not a real quote** — it does NOT include buyer's premium, GST,
+  platform selling fees, or shipping. Once you actually know your winning
+  bid price, run it through the landed-cost spreadsheet (ask Claude for one
+  if you don't have it handy) for the real numbers before deciding.
+- `value_vs_new_pct` — roughly how far below Claude's estimated NEW/retail price
   the current bid sits (Turners items only, and only when Claude was
-  confident enough to estimate a new price).
+  confident enough to estimate a new price). Different from the resale
+  margin above — this compares against buying new, not reselling secondhand.
 - `trademe_search_url` / `facebook_search_url` / `ebay_search_url` — one-tap
   manual comparable-price checks. eBay's link uses their sold+completed
   listings filter, the closest thing to real sold-price data available

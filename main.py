@@ -44,7 +44,8 @@ from scanner.item_detail import fetch_item_detail
 from scanner.filters import passes_initial_filters, passes_detail_filters, matches_exclude_keywords
 from scanner.store import load_seen, save_seen
 from scanner.report import write_report
-from scanner.notifier import send_telegram_messages, build_summary
+from scanner.xlsx_report import write_xlsx_report
+from scanner.notifier import send_telegram_messages, send_telegram_document, build_summary
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
@@ -75,9 +76,22 @@ def _build_row(category: str, item: dict, ai_result: dict, notes_extra: str = ""
     price = item.get("price")
     buy_now = item.get("buy_now_price")
     new_price = ai_result.get("estimated_new_price_nzd")
+    resale_price = ai_result.get("suggested_resale_price_nzd")
     value_vs_new_pct = ""
     if price and new_price and new_price > 0:
         value_vs_new_pct = round((1 - (price / new_price)) * 100)
+
+    # Rough gross margin: suggested resale minus the current bid, BEFORE
+    # buyer's premium, platform fees, or shipping -- a starting point, not
+    # a final number. Use the landed-cost spreadsheet for the full picture
+    # once you've actually got a real winning-bid price.
+    potential_profit_nzd = ""
+    potential_profit_pct = ""
+    cost_basis = price if price is not None else buy_now
+    if resale_price is not None and cost_basis is not None:
+        potential_profit_nzd = round(resale_price - cost_basis)
+        if cost_basis > 0:
+            potential_profit_pct = round((potential_profit_nzd / cost_basis) * 100)
 
     search_term = item["title"]
     notes = notes_extra
@@ -101,6 +115,9 @@ def _build_row(category: str, item: dict, ai_result: dict, notes_extra: str = ""
         "explanation": ai_result.get("explanation", ""),
         "estimated_new_price_nzd": new_price if new_price is not None else "",
         "value_vs_new_pct": value_vs_new_pct,
+        "suggested_resale_price_nzd": resale_price if resale_price is not None else "",
+        "potential_profit_nzd": potential_profit_nzd,
+        "potential_profit_pct": potential_profit_pct,
         "resale_likelihood": ai_result.get("resale_likelihood") or "",
         "resale_reason": ai_result.get("resale_reason", ""),
         **_search_links(search_term),
@@ -245,6 +262,9 @@ def run_blurb_pipeline(config: dict, seen: set, new_seen: set) -> list:
             "explanation": ai_result.get("explanation", ""),
             "estimated_new_price_nzd": "",
             "value_vs_new_pct": "",
+            "suggested_resale_price_nzd": "",
+            "potential_profit_nzd": "",
+            "potential_profit_pct": "",
             "resale_likelihood": ai_result.get("resale_likelihood") or "",
             "resale_reason": ai_result.get("resale_reason", ""),
             **_search_links(search_term),
@@ -288,8 +308,11 @@ def main():
         rows.sort(key=lambda r: (r["score"] is None, -(r["score"] or 0)))
         capped_rows.extend(rows[:max_per_category])
 
-    path = write_report(capped_rows)
-    print(f"[main] wrote {len(capped_rows)} opportunity row(s) to {path}")
+    csv_path = write_report(capped_rows)
+    print(f"[main] wrote {len(capped_rows)} opportunity row(s) to {csv_path}")
+
+    xlsx_path = write_xlsx_report(capped_rows)
+    print(f"[main] wrote live-formula spreadsheet to {xlsx_path}")
 
     summary_messages = build_summary(capped_rows)
     sent = send_telegram_messages(
@@ -301,6 +324,17 @@ def main():
         print(f"[main] Telegram notification sent ({len(summary_messages)} message(s)).")
     elif config.get("telegram_bot_token") or config.get("telegram_chat_id"):
         print("[main] Telegram notification failed -- check bot token / chat ID.")
+
+    doc_sent = send_telegram_document(
+        config.get("telegram_bot_token", ""),
+        config.get("telegram_chat_id", ""),
+        xlsx_path,
+        caption=f"Profit spreadsheet — {len(capped_rows)} opportunities. Edit the assumptions at the top to recalculate every row.",
+    )
+    if doc_sent:
+        print("[main] Telegram spreadsheet sent.")
+    elif config.get("telegram_bot_token") or config.get("telegram_chat_id"):
+        print("[main] Telegram spreadsheet send failed -- check bot token / chat ID.")
 
 
 if __name__ == "__main__":

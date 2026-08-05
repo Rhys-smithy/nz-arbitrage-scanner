@@ -48,6 +48,12 @@ For EACH item, return:
 - estimated_new_price_nzd: your best rough estimate of what this item costs brand new \
   in NZ right now, as an integer NZD. Ballpark from general knowledge, not a live quote -- \
   return null rather than guessing wildly if you genuinely don't know.
+- suggested_resale_price_nzd: your best rough estimate of what THIS item, in its current \
+  condition, would realistically sell for if relisted on Trade Me or Facebook Marketplace \
+  NZ -- not brand-new retail, an honest secondhand price a buyer would actually pay given \
+  the condition/testing notes. This is different from estimated_new_price_nzd (which is \
+  retail) and should normally sit somewhere between the auction price and the new price, \
+  adjusted for condition. Return null if you can't form a reasonable estimate.
 - resale_likelihood: "high", "medium", or "low" -- how easily and quickly you'd expect this \
   specific item to resell if relisted on Trade Me or Facebook Marketplace NZ, based on how \
   common/in-demand that item type generally is in the NZ secondhand market. A rare or niche \
@@ -58,7 +64,7 @@ For EACH item, return:
 
 Respond with ONLY a JSON array, no markdown fences, no preamble, one object per item in \
 the SAME ORDER as given:
-[{"score": <1-10>, "reasons": ["...", ...], "explanation": "...", "estimated_new_price_nzd": <int or null>, "resale_likelihood": "high"|"medium"|"low", "resale_reason": "..."}, ...]"""
+[{"score": <1-10>, "reasons": ["...", ...], "explanation": "...", "estimated_new_price_nzd": <int or null>, "suggested_resale_price_nzd": <int or null>, "resale_likelihood": "high"|"medium"|"low", "resale_reason": "..."}, ...]"""
 
 
 def _extract_json(text: str) -> Optional[list]:
@@ -75,7 +81,7 @@ def score_group(items: List[Dict], api_key: str) -> List[Dict]:
     """Returns a list of {score, reasons, explanation, estimated_new_price_nzd}
     in the same order as `items`. On any failure, returns neutral fallback
     values for every item so the scanner never blocks or crashes on this step."""
-    fallback = [{"score": None, "reasons": [], "explanation": "", "estimated_new_price_nzd": None, "resale_likelihood": None, "resale_reason": ""} for _ in items]
+    fallback = [{"score": None, "reasons": [], "explanation": "", "estimated_new_price_nzd": None, "suggested_resale_price_nzd": None, "resale_likelihood": None, "resale_reason": ""} for _ in items]
 
     if not api_key or not items:
         return fallback
@@ -133,6 +139,12 @@ def score_group(items: List[Dict], api_key: str) -> List[Dict]:
             except (TypeError, ValueError):
                 new_price = None
 
+            resale_price = entry.get("suggested_resale_price_nzd")
+            try:
+                resale_price = int(resale_price) if resale_price is not None else None
+            except (TypeError, ValueError):
+                resale_price = None
+
             resale_likelihood = entry.get("resale_likelihood")
             if resale_likelihood not in ("high", "medium", "low"):
                 resale_likelihood = None
@@ -142,6 +154,7 @@ def score_group(items: List[Dict], api_key: str) -> List[Dict]:
                 "reasons": entry.get("reasons", [])[:3],
                 "explanation": (entry.get("explanation") or "")[:250],
                 "estimated_new_price_nzd": new_price,
+                "suggested_resale_price_nzd": resale_price,
                 "resale_likelihood": resale_likelihood,
                 "resale_reason": (entry.get("resale_reason") or "")[:150],
             })
