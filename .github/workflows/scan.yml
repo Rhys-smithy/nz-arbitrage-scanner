@@ -51,11 +51,13 @@ jobs:
             python main.py
           fi
 
-      - name: Upload CSV report as an artifact
+      - name: Upload reports as an artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: opportunity-report-${{ github.run_id }}
-          path: reports/*.csv
+          path: |
+            reports/*.csv
+            reports/*.xlsx
           if-no-files-found: ignore
           retention-days: 30

@@ -7,9 +7,34 @@ bots are free and take about 2 minutes to set up -- see README.md for the
 BotFather steps.
 """
 import time
+import os
 import requests
 
 CHAR_BUDGET = 3800  # leaves headroom below Telegram's 4096 hard limit
+
+
+def send_telegram_document(bot_token: str, chat_id: str, filepath: str, caption: str = "") -> bool:
+    """Sends a file (e.g. the xlsx report) directly into the Telegram chat
+    as a document attachment, so it's one tap away instead of needing to
+    dig through GitHub Actions artifacts."""
+    if not bot_token or not chat_id or not os.path.exists(filepath):
+        return False
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    try:
+        with open(filepath, "rb") as f:
+            resp = requests.post(
+                url,
+                data={"chat_id": chat_id, "caption": caption[:1024]},
+                files={"document": (os.path.basename(filepath), f)},
+                timeout=60,
+            )
+        if resp.status_code != 200:
+            print(f"[notifier] Telegram document send failed ({resp.status_code}): {resp.text[:300]}")
+            return False
+        return True
+    except requests.RequestException as e:
+        print(f"[notifier] Telegram document send failed: {e}")
+        return False
 
 
 def send_telegram_message(bot_token: str, chat_id: str, text: str) -> bool:
@@ -80,7 +105,12 @@ def build_summary(rows) -> list:
             price_note = f" — ${price}" if price != "" and price is not None else ""
             resale = row.get("resale_likelihood")
             resale_note = {"high": " 🔁high resale", "medium": " 🔁med resale", "low": " 🔁low resale"}.get(resale, "")
-            item_lines = [f'• <a href="{row["url"]}">{row["title"]}</a>{price_note}{score_note}{resale_note}']
+            profit = row.get("potential_profit_nzd")
+            resell_price = row.get("suggested_resale_price_nzd")
+            profit_note = ""
+            if profit != "" and profit is not None and resell_price != "" and resell_price is not None:
+                profit_note = f" → resell ~${resell_price} ({'+' if profit >= 0 else ''}${profit})"
+            item_lines = [f'• <a href="{row["url"]}">{row["title"]}</a>{price_note}{score_note}{resale_note}{profit_note}']
             explanation = row.get("explanation", "")
             if explanation:
                 item_lines.append(f"  <i>{explanation}</i>")
