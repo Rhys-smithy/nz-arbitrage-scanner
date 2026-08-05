@@ -7,9 +7,14 @@ on:
     # NZ daylight saving (roughly late Sept - early Apr) -- adjust the
     # cron string then if the timing bugs you.
     - cron: "0 18 * * *"
-  workflow_dispatch: {}   # <-- lets you trigger a run manually from the
+  workflow_dispatch:      # <-- lets you trigger a run manually from the
                           #     GitHub mobile app: Actions tab > this
                           #     workflow > "Run workflow"
+    inputs:
+      rescan:
+        description: "Rescan everything (ignore what's already been seen -- useful for testing a change)"
+        type: boolean
+        default: false
 
 jobs:
   scan:
@@ -38,7 +43,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PYTHONUNBUFFERED: "1"
-        run: python main.py
+        run: |
+          if [ "${{ github.event.inputs.rescan }}" = "true" ]; then
+            echo "Rescan requested -- ignoring seen-listings cache for this run"
+            python main.py --rescan
+          else
+            python main.py
+          fi
 
       - name: Upload CSV report as an artifact
         if: always()

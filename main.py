@@ -43,7 +43,7 @@ from scanner.grouping import group_similar_items
 from scanner.item_detail import fetch_item_detail
 from scanner.store import load_seen, save_seen
 from scanner.report import write_report
-from scanner.notifier import send_telegram_message, build_summary
+from scanner.notifier import send_telegram_messages, build_summary
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
@@ -100,6 +100,8 @@ def _build_row(category: str, item: dict, ai_result: dict, notes_extra: str = ""
         "explanation": ai_result.get("explanation", ""),
         "estimated_new_price_nzd": new_price if new_price is not None else "",
         "value_vs_new_pct": value_vs_new_pct,
+        "resale_likelihood": ai_result.get("resale_likelihood") or "",
+        "resale_reason": ai_result.get("resale_reason", ""),
         **_search_links(search_term),
         "notes": notes,
     }
@@ -221,6 +223,8 @@ def run_blurb_pipeline(config: dict, seen: set, new_seen: set) -> list:
             "explanation": ai_result.get("explanation", ""),
             "estimated_new_price_nzd": "",
             "value_vs_new_pct": "",
+            "resale_likelihood": ai_result.get("resale_likelihood") or "",
+            "resale_reason": ai_result.get("resale_reason", ""),
             **_search_links(search_term),
             "notes": "; ".join(notes),
         })
@@ -265,14 +269,14 @@ def main():
     path = write_report(capped_rows)
     print(f"[main] wrote {len(capped_rows)} opportunity row(s) to {path}")
 
-    summary = build_summary(capped_rows)
-    sent = send_telegram_message(
+    summary_messages = build_summary(capped_rows)
+    sent = send_telegram_messages(
         config.get("telegram_bot_token", ""),
         config.get("telegram_chat_id", ""),
-        summary,
+        summary_messages,
     )
     if sent:
-        print("[main] Telegram notification sent.")
+        print(f"[main] Telegram notification sent ({len(summary_messages)} message(s)).")
     elif config.get("telegram_bot_token") or config.get("telegram_chat_id"):
         print("[main] Telegram notification failed -- check bot token / chat ID.")
 

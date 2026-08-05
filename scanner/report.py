@@ -20,6 +20,8 @@ FIELDNAMES = [
     "explanation",
     "estimated_new_price_nzd",
     "value_vs_new_pct",
+    "resale_likelihood",
+    "resale_reason",
     "trademe_search_url",
     "facebook_search_url",
     "ebay_search_url",

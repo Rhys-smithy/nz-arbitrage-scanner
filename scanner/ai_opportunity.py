@@ -42,11 +42,13 @@ This is NOT a price or value comparison -- you have no price or condition data, 
 only listing language. Do not imply otherwise in your reasons.
 
 Respond with ONLY a JSON object, no markdown fences, no preamble:
-{"score": <integer 1-10>, "reasons": ["short phrase", ...], "explanation": "1-2 sentences", "flags": ["short phrase", ...]}
+{"score": <integer 1-10>, "reasons": ["short phrase", ...], "explanation": "1-2 sentences", "flags": ["short phrase", ...], "resale_likelihood": "high"|"medium"|"low", "resale_reason": "short phrase"}
 
 "reasons" = up to 3 short phrases explaining the score (why it might be worth a look).
 "explanation" = 1-2 full sentences giving the actual reasoning -- what specifically about this listing's language justifies the score, and what to keep in mind since this is blurb-only, not real price data.
 "flags" = up to 3 short phrases noting any caution signals (e.g. "sold as-is," "damaged stock," "no viewing mentioned"). Empty list if none.
+"resale_likelihood" = how easily/quickly this item TYPE would typically resell on Trade Me or Facebook Marketplace NZ if you had to guess from the title alone (common item = higher likelihood, niche/specialised = lower). This is independent of the score -- a great price on a niche item is still "low" resale likelihood.
+"resale_reason" = one short phrase (under 10 words) for the resale_likelihood call.
 Keep reason phrases under 8 words. If the text gives you nothing useful to go on, score it 4-5 (neutral) with empty reasons/flags rather than guessing high or low."""
 
 
@@ -64,7 +66,7 @@ def analyze_listing(title: str, description: str, api_key: str) -> Dict:
     """Returns {score, reasons, flags}. `score` is None on any failure
     (missing key, API error, bad response) so the scanner never blocks on
     this step -- callers should treat None as "unrated", not zero."""
-    fallback = {"score": None, "reasons": [], "explanation": "", "flags": []}
+    fallback = {"score": None, "reasons": [], "explanation": "", "flags": [], "resale_likelihood": None, "resale_reason": ""}
 
     if not api_key:
         return fallback
@@ -103,11 +105,17 @@ def analyze_listing(title: str, description: str, api_key: str) -> Dict:
         except (TypeError, ValueError):
             score = None
 
+        resale_likelihood = parsed.get("resale_likelihood")
+        if resale_likelihood not in ("high", "medium", "low"):
+            resale_likelihood = None
+
         return {
             "score": score,
             "reasons": parsed.get("reasons", [])[:3],
             "explanation": (parsed.get("explanation") or "")[:400],
             "flags": parsed.get("flags", [])[:3],
+            "resale_likelihood": resale_likelihood,
+            "resale_reason": (parsed.get("resale_reason") or "")[:150],
         }
     except (requests.RequestException, ValueError) as e:
         print(f"[ai_opportunity] request failed: {e}")
