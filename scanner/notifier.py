@@ -46,6 +46,9 @@ def build_summary(rows, max_items_per_category: int = 5) -> str:
             price = row.get("price_nzd")
             price_note = f" — ${price}" if price != "" and price is not None else ""
             lines.append(f'• <a href="{row["url"]}">{row["title"]}</a>{price_note}{score_note}')
+            explanation = row.get("explanation", "")
+            if explanation:
+                lines.append(f"  <i>{explanation[:200]}</i>")
         if len(items) > max_items_per_category:
             lines.append(f"  ...and {len(items) - max_items_per_category} more in this category")
 

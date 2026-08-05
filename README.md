@@ -24,13 +24,29 @@ worth watchlisting yourself.
 
 ## Categories tracked
 
-- **Electronics & Tech** (Turners: electronics, computer, gaming)
-- **Machinery & Tools** (Turners: machinery)
-- **Sport & Leisure** (Turners: sport--leisure)
-- **Jewellery & Watches** (Turners: jewellery)
+**General Goods** (Turners' server-rendered catalog, real prices):
+Electronics & Tech, Machinery & Tools, Sport & Leisure, Jewellery & Watches,
+Toys & Games, House & Garden, Health & Beauty, Antiques & Collectables,
+Clothing, Automotive Parts.
+
+**Vehicles** (a different part of Turners' site -- Year/Make/Model listings,
+odometer, Buy Now prices): Cars, Trucks & Machinery, Motorbikes, Trailers &
+Caravans. Built from a smaller real-page sample than General Goods, so
+treat this one as less battle-tested -- check `scanner/scrapers/
+turners_vehicles.py` first if a vehicle division returns 0 results.
 
 Edit `config.json` → `turners_categories` / `watch_categories` to change
 these -- see "Configuration" below.
+
+## Guaranteeing at least a couple of items per category
+
+If a category doesn't have enough similar items to form a real comparison
+group, the scanner backfills with the cheapest ungrouped items instead of
+reporting nothing -- these get an individual AI assessment (judged against
+general knowledge of typical pricing, not group peers) and are clearly
+flagged `"No comparable item found this run"` in the `notes` column so you
+know it's a weaker signal than a real group comparison. Controlled by
+`min_items_per_category` in config.json (default 2).
 
 ## What this does and doesn't do
 
@@ -99,16 +115,20 @@ structure -- check the relevant file in `scanner/scrapers/`.
 
 - `data_basis` — "Real price + condition" (Turners) vs "Listing language
   only" (Thorntons/Mainland) — always check this before trusting a score.
-- `score` — 1-10, higher = more promising. For Turners items, based on
-  actual price-vs-condition comparison against similar peers. For
-  Thorntons/Mainland, based on listing language signals only.
+- `score` — 1-10, higher = more promising.
+- `reasons` — quick-scan bullet points for the score.
+- `explanation` — the actual reasoning, 1-2 full sentences, for when you
+  want the "why" instead of just a number.
+- `buy_now_price_nzd` — set when a listing has an instant Buy Now option
+  (common on vehicle listings, occasional on General Goods) instead of or
+  alongside a bid price.
 - `value_vs_new_pct` — roughly how far below Claude's estimated new price
   the current bid sits (Turners items only, and only when Claude was
   confident enough to estimate a new price).
 - `trademe_search_url` / `facebook_search_url` / `ebay_search_url` — one-tap
   manual comparable-price checks. eBay's link uses their sold+completed
-  listings filter, which is the closest thing to real sold-price data
-  available anywhere in this report (see below).
+  listings filter, the closest thing to real sold-price data available
+  anywhere in this report (see below).
 
 ## Why not more price data everywhere?
 

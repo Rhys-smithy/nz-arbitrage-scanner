@@ -29,9 +29,16 @@ CATEGORY_SLUGS = {
     "Machinery & Tools": ["machinery"],
     "Sport & Leisure": ["sport--leisure"],
     "Jewellery & Watches": ["jewellery"],
+    "Toys & Games": ["toys"],
+    "House & Garden": ["house--garden"],
+    "Health & Beauty": ["health--beauty"],
+    "Antiques & Collectables": ["antiques", "art", "crafts"],
+    "Clothing": ["clothing"],
+    "Automotive Parts": ["automotive-goods"],
 }
 
 _PRICE_RE = re.compile(r"(Current Bid|Starting Bid)\s*\$?([\d,]+)")
+_BUY_NOW_RE = re.compile(r"BUY NOW\s*\$?([\d,]+)")
 _RESERVE_RE = re.compile(r"(Reserve Met|No Reserve|Reserve Not Met)")
 _CLOSES_RE = re.compile(r"Closes On\s*([0-9]{1,2} [A-Za-z]{3} \d{2})")
 _LOCATION_RE = re.compile(r"Location\s*([A-Za-z0-9 &\-,]+?)(?:Odometer|Category)")
@@ -49,6 +56,14 @@ def _parse_item_container(container_text: str) -> Dict:
         except ValueError:
             price = None
 
+    buy_now_price = None
+    bn = _BUY_NOW_RE.search(container_text)
+    if bn:
+        try:
+            buy_now_price = float(bn.group(1).replace(",", ""))
+        except ValueError:
+            buy_now_price = None
+
     reserve_m = _RESERVE_RE.search(container_text)
     reserve_status = reserve_m.group(1) if reserve_m else None
 
@@ -64,6 +79,7 @@ def _parse_item_container(container_text: str) -> Dict:
     return {
         "price": price,
         "price_type": price_type,
+        "buy_now_price": buy_now_price,
         "reserve_status": reserve_status,
         "closing_date": closing_date,
         "location": location,
@@ -97,7 +113,9 @@ def fetch_category_items(slug: str, user_agent: str) -> List[Dict]:
         item_url = href if href.startswith("http") else BASE_URL + href
         title = link.get("title") or link.get_text(strip=True)
         if not title:
-            continue
+            continue  # this particular <a> has no usable text (likely a thumbnail
+                      # image link) -- don't mark the item_id as seen yet, so the
+                      # real text link for the same item still gets processed
         seen_ids.add(item_id)
 
         container = link.find_parent(["div", "li", "article"]) or link.parent

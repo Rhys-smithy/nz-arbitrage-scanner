@@ -42,11 +42,12 @@ This is NOT a price or value comparison -- you have no price or condition data, 
 only listing language. Do not imply otherwise in your reasons.
 
 Respond with ONLY a JSON object, no markdown fences, no preamble:
-{"score": <integer 1-10>, "reasons": ["short phrase", ...], "flags": ["short phrase", ...]}
+{"score": <integer 1-10>, "reasons": ["short phrase", ...], "explanation": "1-2 sentences", "flags": ["short phrase", ...]}
 
 "reasons" = up to 3 short phrases explaining the score (why it might be worth a look).
+"explanation" = 1-2 full sentences giving the actual reasoning -- what specifically about this listing's language justifies the score, and what to keep in mind since this is blurb-only, not real price data.
 "flags" = up to 3 short phrases noting any caution signals (e.g. "sold as-is," "damaged stock," "no viewing mentioned"). Empty list if none.
-Keep every phrase under 8 words. If the text gives you nothing useful to go on, score it 4-5 (neutral) with empty reasons/flags rather than guessing high or low."""
+Keep reason phrases under 8 words. If the text gives you nothing useful to go on, score it 4-5 (neutral) with empty reasons/flags rather than guessing high or low."""
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -63,7 +64,7 @@ def analyze_listing(title: str, description: str, api_key: str) -> Dict:
     """Returns {score, reasons, flags}. `score` is None on any failure
     (missing key, API error, bad response) so the scanner never blocks on
     this step -- callers should treat None as "unrated", not zero."""
-    fallback = {"score": None, "reasons": [], "flags": []}
+    fallback = {"score": None, "reasons": [], "explanation": "", "flags": []}
 
     if not api_key:
         return fallback
@@ -105,6 +106,7 @@ def analyze_listing(title: str, description: str, api_key: str) -> Dict:
         return {
             "score": score,
             "reasons": parsed.get("reasons", [])[:3],
+            "explanation": (parsed.get("explanation") or "")[:400],
             "flags": parsed.get("flags", [])[:3],
         }
     except (requests.RequestException, ValueError) as e:

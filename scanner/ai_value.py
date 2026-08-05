@@ -24,26 +24,30 @@ MODEL = "claude-haiku-4-5-20251001"
 ANTHROPIC_VERSION = "2023-06-01"
 
 SYSTEM_PROMPT = """You help a New Zealand auction reseller compare several similar \
-items up for auction, to spot which represents the best value.
+items up for auction, to spot which represents the best value. Sometimes you'll only \
+get ONE item (no direct peer to compare against) -- in that case, judge it against your \
+general knowledge of typical pricing for that kind of item instead.
 
-You'll get a JSON array of items of the same rough type (e.g. several "18V Drill" \
-listings), each with: title, current auction price (NZD), condition, testing_level, \
-and any comments/description from the listing.
+You'll get a JSON array of items, each with: title, current auction price (NZD, may be \
+null if bidding hasn't started), buy_now_price (NZD, may be null), condition, \
+testing_level, and any comments/description from the listing.
 
 For EACH item, return:
-- score (1-10): how good a value this specific item is, considering BOTH its price \
-  relative to the other items in the group AND its condition. A cheaper item in worse \
-  condition and a pricier item in better condition might score similarly -- reward the \
-  item with the best condition-for-price tradeoff, not just the lowest price.
-- reasons: up to 3 short phrases (under 8 words each) explaining the score
+- score (1-10): how good a value this specific item is. If comparing multiple items, \
+  reward the best condition-for-price tradeoff, not just the lowest price. If judging \
+  alone, reward how far below typical retail/resale value the price sits.
+- reasons: up to 3 short phrases (under 8 words each) -- quick-scan bullet points.
+- explanation: 1-2 full sentences giving the actual reasoning a person would want before \
+  deciding whether to watchlist this -- e.g. why the price/condition combination is or \
+  isn't compelling, what to double check, or why you're uncertain. Be concrete and specific \
+  to this item, not generic.
 - estimated_new_price_nzd: your best rough estimate of what this item costs brand new \
-  in NZ right now, as an integer NZD. This is a ballpark from general knowledge, not a \
-  live quote -- if you genuinely don't know (obscure item, could be very outdated \
-  knowledge, wildly variable pricing), return null rather than guessing wildly.
+  in NZ right now, as an integer NZD. Ballpark from general knowledge, not a live quote -- \
+  return null rather than guessing wildly if you genuinely don't know.
 
 Respond with ONLY a JSON array, no markdown fences, no preamble, one object per item in \
 the SAME ORDER as given:
-[{"score": <1-10>, "reasons": ["...", ...], "estimated_new_price_nzd": <int or null>}, ...]"""
+[{"score": <1-10>, "reasons": ["...", ...], "explanation": "...", "estimated_new_price_nzd": <int or null>}, ...]"""
 
 
 def _extract_json(text: str) -> Optional[list]:
@@ -57,10 +61,10 @@ def _extract_json(text: str) -> Optional[list]:
 
 
 def score_group(items: List[Dict], api_key: str) -> List[Dict]:
-    """Returns a list of {score, reasons, estimated_new_price_nzd} in the
-    same order as `items`. On any failure, returns neutral fallback values
-    for every item so the scanner never blocks or crashes on this step."""
-    fallback = [{"score": None, "reasons": [], "estimated_new_price_nzd": None} for _ in items]
+    """Returns a list of {score, reasons, explanation, estimated_new_price_nzd}
+    in the same order as `items`. On any failure, returns neutral fallback
+    values for every item so the scanner never blocks or crashes on this step."""
+    fallback = [{"score": None, "reasons": [], "explanation": "", "estimated_new_price_nzd": None} for _ in items]
 
     if not api_key or not items:
         return fallback
@@ -69,6 +73,7 @@ def score_group(items: List[Dict], api_key: str) -> List[Dict]:
         {
             "title": item.get("title", ""),
             "price_nzd": item.get("price"),
+            "buy_now_price_nzd": item.get("buy_now_price"),
             "condition": item.get("condition", "not specified"),
             "testing_level": item.get("testing_level", "not specified"),
             "comments": (item.get("comments", "") or "")[:300],
@@ -118,6 +123,7 @@ def score_group(items: List[Dict], api_key: str) -> List[Dict]:
             results.append({
                 "score": score,
                 "reasons": entry.get("reasons", [])[:3],
+                "explanation": (entry.get("explanation") or "")[:400],
                 "estimated_new_price_nzd": new_price,
             })
         return results
