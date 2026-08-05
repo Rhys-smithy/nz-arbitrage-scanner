@@ -41,6 +41,7 @@ from scanner.ai_opportunity import analyze_listing
 from scanner.ai_value import score_group
 from scanner.grouping import group_similar_items
 from scanner.item_detail import fetch_item_detail
+from scanner.filters import passes_initial_filters, passes_detail_filters, matches_exclude_keywords
 from scanner.store import load_seen, save_seen
 from scanner.report import write_report
 from scanner.notifier import send_telegram_messages, build_summary
@@ -121,6 +122,11 @@ def run_turners_pipeline(category: str, config: dict, seen: set, new_seen: set) 
     if not items:
         return rows
 
+    items = [i for i in items if passes_initial_filters(i, config)]
+    print(f"[main]   Turners '{category}': {len(items)} item(s) after price cap / exclude-keyword filter")
+    if not items:
+        return rows
+
     min_group_size = config.get("min_group_size", 2)
     similarity_threshold = config.get("similarity_threshold", 0.35)
     groups = group_similar_items(items, min_group_size=min_group_size, similarity_threshold=similarity_threshold)
@@ -136,6 +142,13 @@ def run_turners_pipeline(category: str, config: dict, seen: set, new_seen: set) 
             time.sleep(delay)
             grouped_item_ids.add(item["item_id"])
 
+        # Second-pass filter: "damaged"/"faulty"/etc often only shows up in
+        # the condition/comments text, not the title, so re-check now that
+        # we have it.
+        group = [i for i in group if passes_detail_filters(i, config)]
+        if not group:
+            continue
+
         ai_results = score_group(group, config.get("anthropic_api_key", ""))
 
         for item, ai_result in zip(group, ai_results):
@@ -148,20 +161,26 @@ def run_turners_pipeline(category: str, config: dict, seen: set, new_seen: set) 
     # Backfill: if this category didn't hit the minimum via grouped
     # comparisons, pull in the cheapest ungrouped (singleton) items too --
     # scored individually against general knowledge rather than group
-    # peers, clearly flagged as such.
+    # peers, clearly flagged as such. Keeps trying cheapest-first until
+    # enough PASS the detail-level filter too (a cheap item might still
+    # turn out to be damaged once we see its condition notes).
     if new_row_count < min_items:
         ungrouped = [i for i in items if i["item_id"] not in grouped_item_ids and i["url"] not in seen]
         ungrouped_with_price = [i for i in ungrouped if i.get("price") or i.get("buy_now_price")]
         ungrouped_with_price.sort(key=lambda i: (i.get("price") or i.get("buy_now_price") or 0))
-        needed = min_items - new_row_count
 
-        for item in ungrouped_with_price[:needed]:
+        for item in ungrouped_with_price:
+            if new_row_count >= min_items:
+                break
             detail = fetch_item_detail(item["url"], user_agent)
             item.update(detail)
             time.sleep(delay)
+            if not passes_detail_filters(item, config):
+                continue
             ai_result = score_group([item], config.get("anthropic_api_key", ""))[0]
             new_seen.add(item["url"])
             rows.append(_build_row(category, item, ai_result, notes_extra="No comparable item found this run -- standalone assessment only"))
+            new_row_count += 1
 
     return rows
 
@@ -192,6 +211,9 @@ def run_blurb_pipeline(config: dict, seen: set, new_seen: set) -> list:
         new_seen.add(url)
 
         text = f"{listing['title']} {listing.get('description', '')}"
+        if matches_exclude_keywords(text, config.get("exclude_keywords", [])):
+            continue
+
         matches = match_categories(text, watch_categories)
         if not matches:
             continue

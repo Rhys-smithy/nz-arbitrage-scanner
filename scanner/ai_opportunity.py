@@ -41,11 +41,14 @@ opportunity, from 1 to 10:
 This is NOT a price or value comparison -- you have no price or condition data, \
 only listing language. Do not imply otherwise in your reasons.
 
+Strongly prefer auctions that sound like they contain good-condition or lightly-used \
+goods. If the blurb signals damaged, faulty, or "for parts" stock, score it low (1-3).
+
 Respond with ONLY a JSON object, no markdown fences, no preamble:
-{"score": <integer 1-10>, "reasons": ["short phrase", ...], "explanation": "1-2 sentences", "flags": ["short phrase", ...], "resale_likelihood": "high"|"medium"|"low", "resale_reason": "short phrase"}
+{"score": <integer 1-10>, "reasons": ["short phrase", ...], "explanation": "one concise sentence", "flags": ["short phrase", ...], "resale_likelihood": "high"|"medium"|"low", "resale_reason": "short phrase"}
 
 "reasons" = up to 3 short phrases explaining the score (why it might be worth a look).
-"explanation" = 1-2 full sentences giving the actual reasoning -- what specifically about this listing's language justifies the score, and what to keep in mind since this is blurb-only, not real price data.
+"explanation" = ONE concise sentence (max ~25 words) -- the single most important reason for the score, given this is blurb-only, not real price data. No rambling.
 "flags" = up to 3 short phrases noting any caution signals (e.g. "sold as-is," "damaged stock," "no viewing mentioned"). Empty list if none.
 "resale_likelihood" = how easily/quickly this item TYPE would typically resell on Trade Me or Facebook Marketplace NZ if you had to guess from the title alone (common item = higher likelihood, niche/specialised = lower). This is independent of the score -- a great price on a niche item is still "low" resale likelihood.
 "resale_reason" = one short phrase (under 10 words) for the resale_likelihood call.
@@ -112,7 +115,7 @@ def analyze_listing(title: str, description: str, api_key: str) -> Dict:
         return {
             "score": score,
             "reasons": parsed.get("reasons", [])[:3],
-            "explanation": (parsed.get("explanation") or "")[:400],
+            "explanation": (parsed.get("explanation") or "")[:250],
             "flags": parsed.get("flags", [])[:3],
             "resale_likelihood": resale_likelihood,
             "resale_reason": (parsed.get("resale_reason") or "")[:150],

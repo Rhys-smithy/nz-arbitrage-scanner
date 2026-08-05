@@ -32,15 +32,19 @@ You'll get a JSON array of items, each with: title, current auction price (NZD, 
 null if bidding hasn't started), buy_now_price (NZD, may be null), condition, \
 testing_level, and any comments/description from the listing.
 
+Strongly prefer items in good condition, or needing only small/cosmetic fixes. Anything \
+clearly damaged, faulty, or requiring major repair should already have been filtered out \
+before reaching you -- if you spot such language anyway, score it low (1-3) regardless \
+of price.
+
 For EACH item, return:
 - score (1-10): how good a value this specific item is. If comparing multiple items, \
   reward the best condition-for-price tradeoff, not just the lowest price. If judging \
   alone, reward how far below typical retail/resale value the price sits.
 - reasons: up to 3 short phrases (under 8 words each) -- quick-scan bullet points.
-- explanation: 1-2 full sentences giving the actual reasoning a person would want before \
-  deciding whether to watchlist this -- e.g. why the price/condition combination is or \
-  isn't compelling, what to double check, or why you're uncertain. Be concrete and specific \
-  to this item, not generic.
+- explanation: ONE concise sentence (max ~25 words) giving the single most important \
+  reason for the score. Be specific to this item, not generic. No rambling, no hedging \
+  filler -- get straight to the point a person actually needs.
 - estimated_new_price_nzd: your best rough estimate of what this item costs brand new \
   in NZ right now, as an integer NZD. Ballpark from general knowledge, not a live quote -- \
   return null rather than guessing wildly if you genuinely don't know.
@@ -136,7 +140,7 @@ def score_group(items: List[Dict], api_key: str) -> List[Dict]:
             results.append({
                 "score": score,
                 "reasons": entry.get("reasons", [])[:3],
-                "explanation": (entry.get("explanation") or "")[:400],
+                "explanation": (entry.get("explanation") or "")[:250],
                 "estimated_new_price_nzd": new_price,
                 "resale_likelihood": resale_likelihood,
                 "resale_reason": (entry.get("resale_reason") or "")[:150],

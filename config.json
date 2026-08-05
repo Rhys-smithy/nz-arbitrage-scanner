@@ -15,7 +15,6 @@
     "House & Garden",
     "Health & Beauty",
     "Antiques & Collectables",
-    "Clothing",
     "Automotive Parts",
     "Cars",
     "Trucks & Machinery",
@@ -31,7 +30,6 @@
     "House & Garden": ["house", "garden", "furniture", "appliance", "whiteware", "kitchen"],
     "Health & Beauty": ["health", "beauty", "cosmetic", "skincare"],
     "Antiques & Collectables": ["antique", "vintage", "collectable", "collectible", "art"],
-    "Clothing": ["clothing", "clothes", "apparel", "shoes", "fashion"],
     "Automotive Parts": ["car parts", "automotive", "tyres", "wheels"],
     "Cars": ["ute", "car", "sedan", "hatchback", "suv", "vehicle"],
     "Trucks & Machinery": ["truck", "tractor", "digger", "excavator", "forklift"],
@@ -42,6 +40,8 @@
   "min_items_per_category": 2,
   "min_group_size": 2,
   "similarity_threshold": 0.35,
+  "max_price_nzd": 1500,
+  "exclude_keywords": ["damaged", "damage", "faulty", "broken", "not working", "non-runner", "non runner", "for parts", "parts only", "repair needed", "needs repair", "wrecked", "written off", "salvage", "not tested working", "no power", "won't start", "wont start", "does not work", "doesn't work", "cracked screen", "smashed"],
   "request_delay_seconds": 2.0,
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NZ-Reseller-Scanner/1.0 (personal use, low volume)"
 }

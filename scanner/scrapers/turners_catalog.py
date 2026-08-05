@@ -33,7 +33,6 @@ CATEGORY_SLUGS = {
     "House & Garden": ["house--garden"],
     "Health & Beauty": ["health--beauty"],
     "Antiques & Collectables": ["antiques", "art", "crafts"],
-    "Clothing": ["clothing"],
     "Automotive Parts": ["automotive-goods"],
 }
 
