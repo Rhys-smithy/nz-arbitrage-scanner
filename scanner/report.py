@@ -8,27 +8,30 @@ REPORTS_DIR = os.path.join(os.path.dirname(__file__), "..", "reports")
 
 FIELDNAMES = [
     "category",
-    "scanned_at",
     "source",
+    "data_basis",
     "title",
     "url",
-    "matched_keywords",
-    "trademe_comparable_count",
-    "trademe_median_price",
+    "price_nzd",
+    "condition",
+    "score",
+    "reasons",
+    "estimated_new_price_nzd",
+    "value_vs_new_pct",
     "trademe_search_url",
     "facebook_search_url",
+    "ebay_search_url",
     "notes",
 ]
 
 
 def _sort_key(row: Dict):
     # Group by category (alphabetically, "Uncategorised" last), then within
-    # a category put the highest Trade Me comparable price first as a rough
-    # "most worth a look" ordering.
+    # a category put higher-scored items first (unscored last).
     category = row.get("category") or "Uncategorised"
-    price = row.get("trademe_median_price")
-    price_sort = -(price if isinstance(price, (int, float)) and price else -1)
-    return (category == "Uncategorised", category, price_sort)
+    score = row.get("score")
+    score_rank = (score is None, -(score or 0))
+    return (category == "Uncategorised", category, score_rank, row.get("title", ""))
 
 
 def write_report(rows: List[Dict]) -> str:

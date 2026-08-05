@@ -1,24 +1,53 @@
 # NZ Auction Opportunity Scanner
 
-Scans Thorntons, Turners General Goods, and Mainland Auctions for new
-listings, matches them against keywords you care about, pulls Trade Me
-comparable pricing where available, and writes a CSV report you can sort
-through in Excel.
+Tracks 4 categories across Turners, Thorntons, and Mainland Auctions, scores
+opportunities, and writes a CSV report (plus a Telegram ping) of what's
+worth watchlisting yourself.
+
+**Two very different levels of confidence in this report, by design:**
+
+- **Turners (real value scoring):** Turners has a separate, fully
+  server-rendered catalog view with genuine per-item prices, reserve
+  status, and condition ratings. The scanner groups similar items (e.g.
+  three different "18V Drill" listings), has Claude compare price against
+  condition across the group, and estimates roughly how far below retail
+  each one sits. This is a real, if still approximate, value judgement.
+- **Thorntons & Mainland Auctions (blurb scoring only):** both run
+  JavaScript-only live bidding platforms with no equivalent static catalog
+  -- individual lot prices and condition simply aren't visible to a
+  lightweight scraper (confirmed: even Google can't index Thorntons'
+  bidding platform, it's a pure JS app). So these get scored on the
+  auction-EVENT listing language only (words like "unreserved,"
+  "liquidation," "deceased estate") -- a much weaker signal. Every row is
+  labelled with its `data_basis` so you always know which kind you're
+  looking at.
+
+## Categories tracked
+
+- **Electronics & Tech** (Turners: electronics, computer, gaming)
+- **Machinery & Tools** (Turners: machinery)
+- **Sport & Leisure** (Turners: sport--leisure)
+- **Jewellery & Watches** (Turners: jewellery)
+
+Edit `config.json` → `turners_categories` / `watch_categories` to change
+these -- see "Configuration" below.
 
 ## What this does and doesn't do
 
-- **Does:** scrape public auction listing pages, match against your
-  keywords, look up Trade Me comparable pricing via their official API,
-  build a one-click Facebook Marketplace search link for manual checking,
-  and write a dated CSV report.
-- **Doesn't:** know the actual winning bid price (that's only known once an
-  auction closes), automate Facebook Marketplace (no public API, and
-  scraping it violates their terms), or run continuously by itself — you
-  need to schedule it (see below) or run it manually.
-- **Reality check:** this surfaces *categories worth your attention*, not
-  guaranteed profit. Always view items in person / read the manifest before
-  bidding — auction terms almost always say goods can't be fully
-  authenticated and are sold "as is."
+- **Does:** scrape Turners' real catalog prices + condition, have Claude
+  score value within each group of similar items, scrape Thorntons/Mainland
+  Auctions event listings and score them on listing language, build
+  one-click Trade Me / Facebook Marketplace / eBay-sold-listings search
+  links for every match, and write a report capped to your top N per
+  category (default 3).
+- **Doesn't:** know the actual FINAL winning bid (only current bid at
+  scrape time), guarantee the "estimated new price" is accurate (it's
+  Claude's general knowledge, not a live retail lookup -- always verify
+  anything that matters), or run continuously by itself.
+- **On "estimated new price":** treat this as a rough sanity-check, not a
+  quote. It can be wrong for newer products, regional pricing, or obscure
+  items -- Claude is told to return nothing rather than guess wildly when
+  unsure, so a blank value means "no reliable estimate," not zero.
 
 ## Setup
 
@@ -27,42 +56,74 @@ through in Excel.
    ```
    pip install -r requirements.txt
    ```
-3. Get a free Trade Me API key (used for comparable pricing):
-   - Register at https://developer.trademe.co.nz
-   - Create an application, copy the **consumer key**
-   - Paste it into `config.json` → `"trademe_api_key"`
-4. Edit `config.json` to adjust:
-   - `watch_categories` — a dict of category name → list of keywords/phrases
-     to match on. Add, remove, or rename categories freely; the report will
-     group and sort by whatever categories you define here.
-   - `sites` — turn any site on/off
-   - `min_trademe_comparables` — below this count, the report flags the item as "niche, price with care"
+3. Add your Anthropic API key (same account as Cinder & Rune's API billing)
+   to `config.json` → `"anthropic_api_key"`, or set it as an environment
+   variable / GitHub secret (see "Running it from your phone" below). Cost
+   is small -- Claude Haiku, only called on items that already matched a
+   category or grouped with similar peers.
+4. (Optional but recommended) Set up Telegram notifications -- see below.
 
-## Reading the report
+## Configuration (`config.json`)
 
-The CSV is grouped by category (alphabetical, with a blank separator row
-between each), and within a category the highest Trade Me comparable price
-comes first — a rough "most worth a look" ordering. A listing that touches
-more than one category gets filed under whichever it matched the most
-keywords for, with the others noted in the `notes` column.
+- `turners_categories` -- list of category names to run the real Turners
+  value-scoring pipeline for. Must match keys in `CATEGORY_SLUGS` inside
+  `scanner/scrapers/turners_catalog.py` (that's where the actual Turners
+  category URL slugs live -- edit both together if you add a category).
+- `watch_categories` -- keyword lists used to match Thorntons/Mainland
+  Auctions event blurbs. Keys should match `turners_categories` names so
+  everything lands in the same report sections.
+- `sites` -- turn Thorntons / Mainland Auctions on or off individually.
+  Turners always runs (it's the primary real-data source).
+- `max_items_per_category` -- report cap per category, highest score first.
+- `min_group_size` / `similarity_threshold` -- control how Turners items get
+  grouped for comparison. Lower `similarity_threshold` groups more loosely
+  (more false-positive groupings); higher is stricter (more singletons get
+  dropped since there's nothing to compare them against).
 
 ## Running it
 
 ```
 python main.py              # normal run — only reports NEW listings since last run
 python main.py --rescan     # ignore history, report everything currently matching
-python main.py --dry-run    # skip Trade Me lookups (faster, good for testing the scrapers)
 ```
 
-Reports land in `reports/opportunities_<timestamp>.csv`. Open in Excel,
-sort by `trademe_median_price` or `trademe_comparable_count` to see what's
-worth a closer look.
+Reports land in `reports/opportunities_<timestamp>.csv`, grouped by
+category with a blank separator row between each, highest-scored items
+first.
 
-**First run:** use `--dry-run` first to confirm the scrapers are pulling
-listings before burning Trade Me API calls. If a scraper returns 0 results,
-the site likely changed its page structure — the `DETAIL_PATTERN` regex at
-the top of the relevant file in `scanner/scrapers/` is the first thing to
-check and update.
+**First run:** if the Turners catalog scraper returns 0 results, or a
+Thorntons/Mainland scraper returns 0, the site likely changed its page
+structure -- check the relevant file in `scanner/scrapers/`.
+
+## Reading the report
+
+- `data_basis` — "Real price + condition" (Turners) vs "Listing language
+  only" (Thorntons/Mainland) — always check this before trusting a score.
+- `score` — 1-10, higher = more promising. For Turners items, based on
+  actual price-vs-condition comparison against similar peers. For
+  Thorntons/Mainland, based on listing language signals only.
+- `value_vs_new_pct` — roughly how far below Claude's estimated new price
+  the current bid sits (Turners items only, and only when Claude was
+  confident enough to estimate a new price).
+- `trademe_search_url` / `facebook_search_url` / `ebay_search_url` — one-tap
+  manual comparable-price checks. eBay's link uses their sold+completed
+  listings filter, which is the closest thing to real sold-price data
+  available anywhere in this report (see below).
+
+## Why not more price data everywhere?
+
+- **Trade Me:** their API terms as of 2026 restrict registration to
+  approved in-trade/commercial sellers, explicitly excluding personal-use
+  tools like this one. Their website also doesn't publicly show past sold
+  prices (unlike eBay), even to browse manually.
+- **Facebook Marketplace:** no public API, actively blocks automated
+  scraping, requires login for real access.
+- **Thorntons / Mainland Auctions:** JavaScript-only live bidding platforms,
+  no static catalog to scrape (Turners is the exception here, not the rule).
+- **eBay:** does support a public sold-listings search, so that's included
+  as a search link. NZ presence is thin though (Trade Me dominates) --
+  treat eBay results as "what's this worth on the wider market," not what
+  NZ buyers are actually paying.
 
 ## Running it from your phone
 
@@ -72,14 +133,14 @@ same effect two ways, and I'd set both up together:
 ### 1. Automatic scheduled runs (no phone action needed)
 
 This repo includes a GitHub Actions workflow (`.github/workflows/scan.yml`)
-that runs the scanner daily in the cloud — free, no server to maintain.
+that runs the scanner daily in the cloud -- free, no server to maintain.
 
 1. Push this folder to a **private** GitHub repo
 2. In the repo: **Settings → Secrets and variables → Actions → New repository secret**, add:
-   - `TRADEME_API_KEY`
+   - `ANTHROPIC_API_KEY` (from console.anthropic.com -- same account as your Cinder & Rune API billing)
    - `TELEGRAM_BOT_TOKEN` (see below)
    - `TELEGRAM_CHAT_ID` (see below)
-3. Done — it now runs every day at 6am NZST automatically (edit the `cron`
+3. Done -- it now runs every day at 6am NZST automatically (edit the `cron`
    line in the workflow file to change the schedule)
 
 ### 2. Manual on-demand runs from your phone
@@ -96,53 +157,42 @@ Telegram bots are free and take about 2 minutes:
    copy the **bot token** it gives you
 2. Message your new bot anything (e.g. "hi") so it can message you back
 3. Visit `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a browser
-   and find `"chat":{"id": ...}` in the response — that's your **chat ID**
+   and find `"chat":{"id": ...}` in the response -- that's your **chat ID**
 4. Add both as GitHub secrets (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`) as above
 
 Now every run that finds new matches pushes a summary straight to your
-Telegram app, grouped by category with clickable links — check it from
-anywhere. The full CSV is also attached to each GitHub Actions run under
-"Artifacts" if you want the complete detail.
+Telegram app, grouped by category with clickable links and scores -- check
+it from anywhere. The full CSV is also attached to each GitHub Actions run
+under "Artifacts" if you want the complete detail.
 
 ## Scheduling regular scans locally instead (Windows Task Scheduler)
 
 If you'd rather not use GitHub Actions, this also works run entirely from
-your own PC on a schedule — you just won't get the "trigger from phone"
+your own PC on a schedule -- you just won't get the "trigger from phone"
 part, only the Telegram notifications (which still work either way).
-
 
 1. Open **Task Scheduler** → **Create Basic Task**
 2. Name it e.g. "NZ Auction Scanner"
-3. Trigger: **Daily** (or however often you want — these sites post new
-   auctions a few times a week, so daily or every-other-day is plenty)
+3. Trigger: **Daily**
 4. Action: **Start a program**
    - Program/script: `C:\Path\To\Python\python.exe`
    - Arguments: `main.py`
-   - Start in: `C:\projects\nz_arbitrage_scanner` (wherever you put this folder)
+   - Start in: wherever you put this folder
 5. Finish, then right-click the task → **Run** once to confirm it works
-
-Each run only reports *new* listings (tracked in `data/seen.json`), so your
-inbox/folder won't fill up with repeats.
 
 ## Being a good citizen about scraping
 
 - The scrapers use a light rate limit (`request_delay_seconds` in config)
-  and a descriptive User-Agent — don't remove these or crank up frequency.
-  Hammering these sites could get your IP blocked, and it's not necessary —
-  new auctions don't appear that often.
-- Double-check each site's Terms of Service occasionally; auction houses
-  sometimes change their stance on automated access.
-- This is built for personal, low-volume use — not for reselling the data
-  or running at commercial scale.
+  and a descriptive User-Agent -- don't remove these or crank up frequency.
+- Double-check each site's Terms of Service occasionally.
+- This is built for personal, low-volume use, not commercial scale.
 
 ## Extending it
 
-- **Add another site:** create a new file in `scanner/scrapers/` following
-  the pattern in `thorntons.py`, then register it in
-  `scanner/scrapers/__init__.py` and `config.json`.
-- **Mainland Auctions also sells via Trade Me** (seller ID 6482428) — see
-  the comment in `scanner/scrapers/mainland_auctions.py` if you want to pull
-  that in too via the Trade Me API's member-listing search.
-- **Add price-drop tracking:** the `data/seen.json` cache currently only
-  stores URLs; you could extend it to store the last-seen price and flag
-  when a Trade Me listing's asking price drops.
+- **Add a Turners category:** add the real slug(s) to `CATEGORY_SLUGS` in
+  `scanner/scrapers/turners_catalog.py` (check
+  https://www.turners.co.nz/General-Goods/Search/ for the current list),
+  then add the category name to `config.json` → `turners_categories`.
+- **Add another blurb-scored site:** follow the pattern in
+  `scanner/scrapers/thorntons.py`, register it in
+  `scanner/scrapers/__init__.py` and `config.json` → `sites`.

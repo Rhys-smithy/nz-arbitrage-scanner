@@ -36,13 +36,16 @@ def build_summary(rows, max_items_per_category: int = 5) -> str:
         by_category.setdefault(row["category"], []).append(row)
 
     lines = [f"<b>NZ Auction Scanner — {len(rows)} new match(es)</b>\n"]
+
     for category in sorted(by_category.keys()):
-        items = by_category[category]
+        items = sorted(by_category[category], key=lambda r: (r.get("score") is None, -(r.get("score") or 0)))
         lines.append(f"\n<b>{category}</b> ({len(items)})")
         for row in items[:max_items_per_category]:
-            price = row.get("trademe_median_price")
-            price_note = f" — TM median ${price}" if price else ""
-            lines.append(f'• <a href="{row["url"]}">{row["title"]}</a>{price_note}')
+            score = row.get("score")
+            score_note = f" [{score}/10]" if score is not None else ""
+            price = row.get("price_nzd")
+            price_note = f" — ${price}" if price != "" and price is not None else ""
+            lines.append(f'• <a href="{row["url"]}">{row["title"]}</a>{price_note}{score_note}')
         if len(items) > max_items_per_category:
             lines.append(f"  ...and {len(items) - max_items_per_category} more in this category")
 
