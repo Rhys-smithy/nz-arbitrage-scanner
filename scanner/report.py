@@ -15,6 +15,7 @@ FIELDNAMES = [
     "price_nzd",
     "buy_now_price_nzd",
     "condition",
+    "location",
     "score",
     "reasons",
     "explanation",
