@@ -138,18 +138,18 @@ def fetch_category_items(slug: str, user_agent: str) -> List[Dict]:
                       # real text link for the same item still gets processed
         seen_ids.add(item_id)
 
-            container = link.find_parent(["div", "li", "article"]) or link.parent
-            container_text = container.get_text(" ", strip=True) if container else ""
-            # Walk up until the block actually contains a price marker -- the
-            # immediate parent is often just the image/link tile.
-            node = container
-            for _ in range(4):
-                if _has_price_marker(container_text):
-                    break
-                node = node.find_parent(["div", "li", "article"]) if node else None
-                if not node:
-                    break
-                container_text = node.get_text(" ", strip=True)
+        container = link.find_parent(["div", "li", "article"]) or link.parent
+        container_text = container.get_text(" ", strip=True) if container else ""
+        # Walk up until the block actually contains a price marker -- the
+        # immediate parent is often just the image/link tile.
+        node = container
+        for _ in range(4):
+            if _has_price_marker(container_text):
+                break
+            node = node.find_parent(["div", "li", "article"]) if node else None
+            if not node:
+                break
+            container_text = node.get_text(" ", strip=True)
 
         parsed = _parse_item_container(container_text)
 
