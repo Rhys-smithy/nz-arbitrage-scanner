@@ -89,5 +89,67 @@ class TestProviderRequestFailureHandling(unittest.TestCase):
                 self.assertEqual(results[0].source, "web_search:tavily")
 
 
+class TestTavilyAuthentication(unittest.TestCase):
+    # Tavily's current API authenticates via `Authorization: Bearer <key>`,
+    # not an `api_key` field in the JSON body (their OpenAPI spec declares
+    # `security: bearerAuth` on /search with no api_key in the request
+    # schema) -- sending it in the body gets silently rejected with a 403
+    # at Tavily's edge, before it's even billed against the account. This
+    # regression-tests the fix: the key goes out ONLY as a Bearer header,
+    # never in the request body, so it can't leak into logs via the payload.
+    _FAKE_KEY = "test-key-not-a-real-secret"
+
+    def test_sends_bearer_authorization_header(self):
+        with mock.patch.dict(os.environ, {"TAVILY_API_KEY": self._FAKE_KEY}, clear=True):
+            provider = TavilySearchProvider()
+            mock_resp = mock.Mock()
+            mock_resp.json.return_value = {"results": []}
+            mock_resp.raise_for_status.return_value = None
+            with mock.patch(
+                "scanner.search.providers.tavily.requests.post", return_value=mock_resp
+            ) as mock_post:
+                provider.search("query")
+
+            self.assertEqual(mock_post.call_count, 1)
+            _, kwargs = mock_post.call_args
+            self.assertIn("headers", kwargs)
+            self.assertEqual(kwargs["headers"].get("Authorization"), f"Bearer {self._FAKE_KEY}")
+
+    def test_api_key_not_present_in_request_body(self):
+        with mock.patch.dict(os.environ, {"TAVILY_API_KEY": self._FAKE_KEY}, clear=True):
+            provider = TavilySearchProvider()
+            mock_resp = mock.Mock()
+            mock_resp.json.return_value = {"results": []}
+            mock_resp.raise_for_status.return_value = None
+            with mock.patch(
+                "scanner.search.providers.tavily.requests.post", return_value=mock_resp
+            ) as mock_post:
+                provider.search("query")
+
+            _, kwargs = mock_post.call_args
+            self.assertIn("json", kwargs)
+            self.assertNotIn("api_key", kwargs["json"])
+            # The key must only ever travel via the header, never the body.
+            self.assertNotIn(self._FAKE_KEY, kwargs["json"].values())
+
+    def test_request_body_still_carries_query_params(self):
+        with mock.patch.dict(os.environ, {"TAVILY_API_KEY": self._FAKE_KEY}, clear=True):
+            provider = TavilySearchProvider()
+            mock_resp = mock.Mock()
+            mock_resp.json.return_value = {"results": []}
+            mock_resp.raise_for_status.return_value = None
+            with mock.patch(
+                "scanner.search.providers.tavily.requests.post", return_value=mock_resp
+            ) as mock_post:
+                provider.search("query", max_results=5, include_domains=["trademe.co.nz"])
+
+            _, kwargs = mock_post.call_args
+            body = kwargs["json"]
+            self.assertEqual(body["query"], "query")
+            self.assertEqual(body["search_depth"], "basic")
+            self.assertEqual(body["max_results"], 5)
+            self.assertEqual(body["include_domains"], ["trademe.co.nz"])
+
+
 if __name__ == "__main__":
     unittest.main()
