@@ -42,8 +42,14 @@ class TavilySearchProvider(SearchProvider):
             print("[search/tavily] TAVILY_API_KEY not set -- skipping (no results fabricated).")
             return []
 
+        # Tavily's current API authenticates via a Bearer token in the
+        # Authorization header -- their OpenAPI spec declares `security:
+        # bearerAuth` on /search and its request-body schema has no `api_key`
+        # field. Sending the key in the body instead of this header gets
+        # rejected (403) before it ever reaches Tavily's app-level auth,
+        # so it doesn't even show up as billed usage on the dashboard.
+        headers = {"Authorization": f"Bearer {self._api_key}"}
         payload = {
-            "api_key": self._api_key,
             "query": query,
             "search_depth": "basic",  # 1 credit/request; "advanced" costs 2
             "max_results": min(max_results, 20),
@@ -54,7 +60,7 @@ class TavilySearchProvider(SearchProvider):
             payload["include_domains"] = include_domains
 
         try:
-            resp = requests.post(API_URL, json=payload, timeout=20)
+            resp = requests.post(API_URL, json=payload, headers=headers, timeout=20)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
