@@ -42,6 +42,16 @@ _RESERVE_RE = re.compile(r"(Reserve Met|No Reserve|Reserve Not Met)")
 _CLOSES_RE = re.compile(r"Closes On\s*([0-9]{1,2} [A-Za-z]{3} \d{2})")
 _LOCATION_RE = re.compile(r"Location\s*([A-Za-z0-9 &\-,]+?)(?:Odometer|Category)")
 _CATEGORY_RE = re.compile(r"Category\s*([A-Za-z0-9 &\->,]+?)(?:Online Auction|Email Consultant|$)")
+_NO_PRICING_RE = re.compile(r"Pricing coming soon", re.I)
+_STARTS_RE = re.compile(r"Starts On\s*(.+?)(?:\s+Location|\s+Category|\Z)")
+_PRICE_MARKERS = ("BUY NOW", "Current Bid", "Starting Bid", "Pricing coming soon")
+
+
+def _has_price_marker(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker.lower() in lowered for marker in _PRICE_MARKERS)
+
+
 
 
 def _parse_item_container(container_text: str) -> Dict:
@@ -72,6 +82,15 @@ def _parse_item_container(container_text: str) -> Dict:
     location_m = _LOCATION_RE.search(container_text)
     location = location_m.group(1).strip() if location_m else ""
 
+    pricing_status = "priced"
+    starts_on = ""
+    if _NO_PRICING_RE.search(container_text):
+        pricing_status = "no_pricing"
+    elif price is None and buy_now_price is None:
+        starts_m = _STARTS_RE.search(container_text)
+        starts_on = starts_m.group(1).strip() if starts_m else ""
+        pricing_status = "opens_soon" if starts_on else "no_pricing"
+
     category_m = _CATEGORY_RE.search(container_text)
     subcategory = category_m.group(1).strip() if category_m else ""
 
@@ -83,6 +102,8 @@ def _parse_item_container(container_text: str) -> Dict:
         "closing_date": closing_date,
         "location": location,
         "subcategory": subcategory,
+        "pricing_status": pricing_status,
+        "starts_on": starts_on,
     }
 
 
@@ -117,14 +138,18 @@ def fetch_category_items(slug: str, user_agent: str) -> List[Dict]:
                       # real text link for the same item still gets processed
         seen_ids.add(item_id)
 
-        container = link.find_parent(["div", "li", "article"]) or link.parent
-        # Walk up a couple more levels if the immediate parent is too small
-        # to contain the price block (structure may vary).
-        container_text = container.get_text(" ", strip=True) if container else ""
-        if "Current Bid" not in container_text and "Starting Bid" not in container_text:
-            grandparent = container.find_parent(["div", "li", "article"]) if container else None
-            if grandparent:
-                container_text = grandparent.get_text(" ", strip=True)
+            container = link.find_parent(["div", "li", "article"]) or link.parent
+            container_text = container.get_text(" ", strip=True) if container else ""
+            # Walk up until the block actually contains a price marker -- the
+            # immediate parent is often just the image/link tile.
+            node = container
+            for _ in range(4):
+                if _has_price_marker(container_text):
+                    break
+                node = node.find_parent(["div", "li", "article"]) if node else None
+                if not node:
+                    break
+                container_text = node.get_text(" ", strip=True)
 
         parsed = _parse_item_container(container_text)
 
