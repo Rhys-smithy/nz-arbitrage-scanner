@@ -36,6 +36,14 @@ _PRICE_RE = re.compile(r"(Current Bid|Starting Bid)\s*\$?([\d,]+)")
 _BUY_NOW_RE = re.compile(r"BUY NOW\s*\$?([\d,]+)")
 _ODOMETER_RE = re.compile(r"Odometer\s*([\d,]+)\s*(km|hr)")
 _LOCATION_RE = re.compile(r"Location\s*([A-Za-z0-9 &\-,]+?)(?:Odometer|Category|Online Auction|Email Consultant|View|\Z)")
+_PRICE_MARKERS = ("BUY NOW", "Current Bid", "Starting Bid", "Pricing coming soon")
+
+
+def _has_price_marker(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker.lower() in lowered for marker in _PRICE_MARKERS)
+
+
 
 
 def _parse_vehicle_container(container_text: str) -> Dict:
@@ -110,10 +118,17 @@ def fetch_division(division_name: str, user_agent: str) -> List[Dict]:
 
         container = link.find_parent(["div", "li", "article"]) or link.parent
         container_text = container.get_text(" ", strip=True) if container else ""
-        if "Odometer" not in container_text:
-            grandparent = container.find_parent(["div", "li", "article"]) if container else None
-            if grandparent:
-                container_text = grandparent.get_text(" ", strip=True)
+        # Walk up until the block holds BOTH the spec table and the price
+        # panel. On vehicle listings these sit in sibling containers, so
+        # stopping at the first "Odometer" match misses "BUY NOW $x" entirely.
+        node = container
+        for _ in range(4):
+            if "Odometer" in container_text and _has_price_marker(container_text):
+                break
+            node = node.find_parent(["div", "li", "article"]) if node else None
+            if not node:
+                break
+            container_text = node.get_text(" ", strip=True)
 
         parsed = _parse_vehicle_container(container_text)
 
