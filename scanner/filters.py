@@ -25,6 +25,11 @@ def matches_exclude_keywords(text: str, keywords: List[str]) -> bool:
 def passes_initial_filters(item: Dict, config: Dict) -> bool:
     """Filter applied right after scraping, before any detail fetch or
     grouping -- title + price only, since that's all we have yet."""
+    # Turners lists some lots as "Pricing coming soon" with no bid at all --
+    # there's nothing to value, so drop them before spending an AI call. Lots
+    # that simply haven't opened yet ("opens_soon") are kept.
+    if item.get("pricing_status") == "no_pricing":
+        return False
     if exceeds_price_cap(item, config.get("max_price_nzd")):
         return False
     if matches_exclude_keywords(item.get("title", ""), config.get("exclude_keywords", [])):
