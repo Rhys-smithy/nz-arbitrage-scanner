@@ -111,6 +111,7 @@ def _build_row(category: str, item: dict, ai_result: dict, notes_extra: str = ""
         "buy_now_price_nzd": buy_now if buy_now is not None else "",
         "condition": item.get("condition", ""),
         "location": item.get("location", ""),
+        "auction_status": "Opens soon" if item.get("pricing_status") == "opens_soon" else "",
         "score": ai_result.get("score"),
         "reasons": "; ".join(ai_result.get("reasons", [])),
         "explanation": ai_result.get("explanation", ""),
