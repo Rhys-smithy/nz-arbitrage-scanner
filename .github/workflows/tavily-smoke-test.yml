@@ -1,0 +1,50 @@
+name: Tavily Smoke Test (temporary, single query)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Single live Tavily search (no key ever printed)
+        env:
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+        run: |
+          python - << 'PY'
+          import os
+          import requests
+
+          key = os.environ["TAVILY_API_KEY"]
+          resp = requests.post(
+              "https://api.tavily.com/search",
+              json={
+                  "query": "Nintendo Switch NZ",
+                  "search_depth": "basic",
+                  "max_results": 1,
+                  "include_usage": True,
+              },
+              headers={"Authorization": f"Bearer {key}"},
+              timeout=20,
+          )
+          print(f"[smoke-test] HTTP status: {resp.status_code}")
+          resp.raise_for_status()
+          data = resp.json()
+          results = data.get("results", [])
+          print(f"[smoke-test] results returned: {len(results)}")
+          if results:
+              r = results[0]
+              print(f"[smoke-test] sample result title: {r.get('title')!r}")
+              print(f"[smoke-test] sample result url: {r.get('url')!r}")
+          print(f"[smoke-test] usage/credits info: {data.get('usage')}")
+          print("[smoke-test] SUCCESS -- single live Tavily request completed.")
+          PY
