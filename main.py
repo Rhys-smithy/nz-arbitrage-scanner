@@ -279,9 +279,31 @@ def run_blurb_pipeline(config: dict, seen: set, new_seen: set) -> list:
 def main():
     parser = argparse.ArgumentParser(description="NZ auction opportunity scanner")
     parser.add_argument("--rescan", action="store_true", help="Ignore seen-cache, report all matches")
+    parser.add_argument(
+        "--mode",
+        choices=["scan", "discover"],
+        default="scan",
+        help="'scan' (default) runs the existing Turners/Thorntons/Mainland auction pipeline. "
+             "'discover' runs the Phase 3 web-search opportunity discovery pipeline instead "
+             "(requires discovery.enabled=true in config.json and a configured search provider).",
+    )
     args = parser.parse_args()
 
     config = load_config()
+
+    if args.mode == "discover":
+        from scanner.discover import print_top_opportunities, run_discovery, send_discovery_alerts
+
+        opportunities = run_discovery(config)
+        if not opportunities:
+            print("[main] discovery mode found no opportunities this run.")
+            return
+        print_top_opportunities(opportunities)
+        sent = send_discovery_alerts(opportunities, config)
+        if sent:
+            print(f"[main] sent {sent} Telegram flip alert(s).")
+        return
+
     seen = set() if args.rescan else load_seen()
     new_seen = set(seen)
 

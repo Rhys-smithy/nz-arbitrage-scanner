@@ -148,3 +148,37 @@ def build_summary(rows) -> list:
             messages[i] += f"\n\n<i>(message {i + 1}/{len(messages)})</i>"
 
     return messages
+
+
+def build_flip_alert(opportunity) -> str:
+    """Phase 2I: rich per-opportunity alert format (spec section 21).
+
+    Takes a scanner.models.Opportunity. Purely a string formatter --
+    does not send anything itself, so it's reused by both the
+    flip-hunter demo pipeline and can be unit tested without network I/O.
+    """
+    o = opportunity
+    val = o.valuation
+    lines = ["\U0001F525 <b>FLIP ALERT</b>", "", f"<b>{o.title}</b>", ""]
+    lines.append(f"Current: ${o.current_price:.0f}" if o.current_price is not None else "Current: unknown")
+    if o.max_buy_price is not None:
+        lines.append(f"Maximum buy: ${o.max_buy_price:.0f}")
+    lines.append("")
+    if val.quick_sale_low is not None:
+        lines.append(f"Quick-sale resale: ${val.quick_sale_low:.0f}-{val.quick_sale_high:.0f}")
+    if o.expected_net_profit_low is not None:
+        lines.append(f"Expected net profit: ${o.expected_net_profit_low:.0f}")
+    if o.roi_low_pct is not None:
+        lines.append(f"ROI: {o.roi_low_pct:.0f}%")
+    lines.append("")
+    if o.flip_score is not None:
+        lines.append(f"Flip score: {o.flip_score}/100")
+    lines.append(f"Confidence: {val.confidence_pct:.0f}%")
+    lines.append(f"Liquidity: {o.liquidity}")
+    lines.append("")
+    if o.bidding_room is not None:
+        lines.append(f"${o.bidding_room:.0f} bidding room remaining.")
+    lines.append("")
+    lines.append(f"Decision: {o.decision}")
+    lines.append(f'<a href="{o.url}">Listing</a>')
+    return "\n".join(lines)

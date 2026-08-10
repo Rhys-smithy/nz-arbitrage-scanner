@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 data/seen.json
+data/discovered.json
+data/search_stats.json
 reports/*.csv
 
 # If you fill in real keys in config.json for local use, uncomment this

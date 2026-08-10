@@ -56,6 +56,21 @@ jobs:
             python main.py
           fi
 
+      - name: Run opportunity discovery (Phase 3, web search)
+        # Separate from the main scan above -- searches the open web via
+        # Tavily for opportunities beyond Turners/Thorntons/Mainland.
+        # continue-on-error: this is newer than the core scan step and
+        # its failure shouldn't block the daily report/commit below.
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WEB_SEARCH_PROVIDER: ${{ vars.WEB_SEARCH_PROVIDER }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: python main.py --mode discover
+
       # ------------------------------------------------------------------
       # Build a small manifest so the dashboard can find reports without
       # having to list the directory (and can show newest-first instantly).
