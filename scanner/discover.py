@@ -23,7 +23,7 @@ from scanner.notifier import build_flip_alert, send_telegram_message
 from scanner.product_id import detect_condition_risk, identify_product
 from scanner.query_generator import generate_discovery_queries
 from scanner.researcher import research
-from scanner.search.util import dedupe_results, identify_marketplace
+from scanner.search.util import dedupe_results, identify_marketplace, is_individual_listing_url
 from scanner.search.web_search import WebSearchSource
 from scanner.search_stats import (
     extract_concept_from_query,
@@ -93,9 +93,16 @@ def run_discovery(config: dict) -> list[Opportunity]:
     print(f"[discover] {len(all_results)} raw results -> {len(deduped)} unique listings "
           f"({len(new_urls)} newly seen).")
 
+    # Only individual listing/lot pages on a recognised marketplace have a real
+    # price to extract and value -- category pages, browse pages, YouTube videos,
+    # Etsy category pages, retailer collection pages, etc. are excluded outright
+    # (identify_marketplace() alone isn't enough here: it returns the bare hostname
+    # for any unrecognised domain rather than "unknown", so a naive
+    # "!= unknown" check let almost everything through).
+    candidates = [r for r in deduped if is_individual_listing_url(r.url)]
+
     # Cheapest-first, capped to bankroll preference, then to max_research_items --
     # spec section 15: prioritise the $500 bankroll, avoid flooding with expensive items.
-    candidates = [r for r in deduped if identify_marketplace(r.url) not in ("unknown",)]
     candidates.sort(
         key=lambda r: (
             r.price is None,                          # priced items first
