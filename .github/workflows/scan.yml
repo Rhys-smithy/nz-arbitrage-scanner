@@ -16,6 +16,11 @@ on:
         type: boolean
         default: false
 
+# Needed so the workflow can commit the generated reports back into the repo,
+# which is what lets the dashboard load them automatically.
+permissions:
+  contents: write
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -49,6 +54,89 @@ jobs:
             python main.py --rescan
           else
             python main.py
+          fi
+
+      # ------------------------------------------------------------------
+      # Build a small manifest so the dashboard can find reports without
+      # having to list the directory (and can show newest-first instantly).
+      # Also prunes old reports so the repo doesn't grow forever.
+      # ------------------------------------------------------------------
+      - name: Prune old reports and build manifest
+        if: always()
+        run: |
+          mkdir -p reports
+          python - <<'PY'
+          import json, os, re, glob
+          from datetime import datetime
+
+          KEEP = 60  # how many report *runs* to retain in the repo
+
+          reports_dir = "reports"
+          csvs = sorted(glob.glob(os.path.join(reports_dir, "opportunities_*.csv")))
+
+          def stamp(path):
+              m = re.search(r"opportunities_(\d{8})_(\d{4})", os.path.basename(path))
+              if not m:
+                  return None
+              try:
+                  return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M")
+              except ValueError:
+                  return None
+
+          dated = [(stamp(p), p) for p in csvs]
+          dated = [(d, p) for d, p in dated if d is not None]
+          dated.sort(key=lambda t: t[0])
+
+          # Prune oldest runs beyond KEEP (csv + matching xlsx).
+          for _, path in dated[:-KEEP] if len(dated) > KEEP else []:
+              xlsx = path[:-4] + ".xlsx"
+              for f in (path, xlsx):
+                  if os.path.exists(f):
+                      os.remove(f)
+                      print("pruned", f)
+
+          dated = dated[-KEEP:]
+
+          entries = []
+          for d, path in reversed(dated):   # newest first
+              base = os.path.basename(path)
+              xlsx = path[:-4] + ".xlsx"
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      # count non-blank data lines (blank rows are category separators)
+                      lines = [ln for ln in f.read().splitlines()[1:] if ln.strip(",").strip()]
+                  row_count = len(lines)
+              except OSError:
+                  row_count = None
+              entries.append({
+                  "csv": base,
+                  "xlsx": os.path.basename(xlsx) if os.path.exists(xlsx) else None,
+                  "timestamp": d.isoformat(timespec="minutes"),
+                  "rows": row_count,
+              })
+
+          manifest = {
+              "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+              "count": len(entries),
+              "reports": entries,
+          }
+          with open(os.path.join(reports_dir, "index.json"), "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+          print("manifest written with", len(entries), "report(s)")
+          PY
+
+      - name: Commit reports back to the repo
+        if: always()
+        run: |
+          git config user.name  "nz-auction-scanner[bot]"
+          git config user.email "actions@users.noreply.github.com"
+          git add -f reports/
+          if git diff --staged --quiet; then
+            echo "No report changes to commit."
+          else
+            git commit -m "Scan results $(date -u '+%Y-%m-%d %H:%M UTC') [skip ci]"
+            # Retry once in case a concurrent run pushed first.
+            git push || (git pull --rebase && git push)
           fi
 
       - name: Upload reports as an artifact
