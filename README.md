@@ -239,3 +239,148 @@ part, only the Telegram notifications (which still work either way).
 - **Add another blurb-scored site:** follow the pattern in
   `scanner/scrapers/thorntons.py`, register it in
   `scanner/scrapers/__init__.py` and `config.json` → `sites`.
+
+## Phase 3: AI Flip Hunter -- opportunity discovery via web search
+
+Everything above (Turners/Thorntons/Mainland scanning) is the original,
+default `python3 main.py` pipeline and is unaffected by any of this.
+Phase 3 adds a second, separate entry point:
+
+```
+python3 main.py --mode discover
+```
+
+which searches the open web (via a configured search API, not direct
+scraping) for resale opportunities beyond the three auction sites, runs
+them through the same Phase 2 valuation/cost/max-buy-price/Flip Score
+engine, and ranks the results. It does nothing until you opt in --
+`config.json` → `"discovery"` → `"enabled"` defaults to `false`.
+
+### AVAILABLE NOW vs REQUIRES API CREDENTIALS
+
+| Capability | Status |
+|---|---|
+| Turners/Thorntons/Mainland scanning (`--mode scan`, default) | **Available now** -- no setup beyond what Phase 1/2 already needed |
+| Deterministic valuation/cost/max-buy-price/Flip Score engine | **Available now** -- pure Python, no external service |
+| `--mode discover` web search + comparable research | **Requires** a search provider API key (see below) |
+| AI product identification / Researcher / Trader passes | **Requires** `ANTHROPIC_API_KEY` (same key Phase 2 already uses) -- without it, product ID is skipped and evidence review is skipped, discovery still runs on deterministic evidence stats alone |
+| Telegram flip alerts from discovery mode | **Requires** `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` (same as existing notifier) |
+
+### Search provider setup
+
+Discovery mode calls a legitimate third-party search API -- it never
+scrapes Google/Bing/DuckDuckGo HTML directly and never bypasses a search
+engine's bot protection. Set `WEB_SEARCH_PROVIDER` to select one:
+
+**`tavily` -- recommended, free tier, no credit card** (verify current
+terms at tavily.com before relying on this long-term; researched August
+2026): 1,000 free API credits/month, basic search = 1 credit/request.
+Supports domain-restricted search (used here instead of Google's `site:`
+operator for e.g. `site:trademe.co.nz` style discovery).
+
+```
+WEB_SEARCH_PROVIDER=tavily
+TAVILY_API_KEY=<your key from tavily.com>
+```
+
+**`brave`** and **`serpapi`** -- also implemented and swappable via the
+same `WEB_SEARCH_PROVIDER` env var, but as of the research done for this
+phase (Feb 2026), Brave Search API dropped its free tier (now
+credit-based/paid) and SerpApi has never had more than a 100-search trial.
+Both are here as ready-to-use options if you later decide the paid tiers
+are worth it -- they are **not** selected by default and require their own
+`BRAVE_API_KEY` / `SERPAPI_API_KEY`.
+
+With no `WEB_SEARCH_PROVIDER` set, discovery mode prints a clear
+"not configured, no results fabricated" message and exits cleanly --
+it never invents listings or prices.
+
+### Environment variables (Phase 3 additions)
+
+| Variable | Required for | Notes |
+|---|---|---|
+| `WEB_SEARCH_PROVIDER` | `--mode discover` | `tavily` (recommended), `brave`, or `serpapi` |
+| `TAVILY_API_KEY` | `WEB_SEARCH_PROVIDER=tavily` | Free tier, no card |
+| `BRAVE_API_KEY` | `WEB_SEARCH_PROVIDER=brave` | Paid as of Feb 2026 |
+| `SERPAPI_API_KEY` | `WEB_SEARCH_PROVIDER=serpapi` | Paid, 100-search free trial only |
+| `ANTHROPIC_API_KEY` | AI product ID + Researcher/Trader | Already used by Phase 2 |
+
+### Rate limits / search budget
+
+`config.json` → `"discovery"` controls how many searches a single
+`--mode discover` run can make:
+
+```json
+"discovery": {
+  "enabled": false,
+  "max_queries_per_run": 15,
+  "max_results_per_query": 8,
+  "max_research_items": 5,
+  "prefer_purchase_price_below": 250,
+  "products": ["Nintendo Switch", "Canon camera", ...]
+}
+```
+
+At the shipped defaults, one run does at most 15 discovery queries plus up
+to 5 researched candidates × ~4 comparable-research queries each (≈35
+queries/run worst case). Run once daily and that comfortably fits inside
+Tavily's 1,000/month free credits with room to spare; tune
+`max_queries_per_run`/`max_research_items` down further, or run less than
+daily, if you add more product categories.
+
+### Legal / ToS limitations (unchanged from Phase 2, restated for Phase 3)
+
+- No CAPTCHA bypass, no authentication bypass, no bot-detection evasion,
+  no fake accounts, no scraping Trade Me or Facebook Marketplace directly,
+  no scraping search engine result pages directly.
+- Trade Me and Facebook Marketplace listings are only ever discovered
+  through a search provider's already-public index (e.g. `site:
+  trademe.co.nz` via the search API) -- this app never talks to either
+  site's servers directly for discovery.
+- eBay "sold" evidence comes from search-snippet text signals (e.g. a
+  listing titled "... - sold") or explicit sold flags where the provider
+  supplies one -- not from logging into eBay or using an unlicensed
+  scraper.
+
+### Example discovery command and output
+
+```
+$ python3 main.py --mode discover
+[discover] running 15 discovery queries...
+[discover] 42 raw results -> 18 unique listings (11 newly seen).
+
+🔥 TOP FLIPS
+
+1. Carrera Digital 132 GT Championship bundle NZ - Trade Me
+Current: $180
+Quick resale: $288-328
+Expected profit: $40-80
+ROI: 16%-32%
+Max buy: $137
+Score: 46
+Confidence: 28%
+Decision: PASS
+Listing: https://www.trademe.co.nz/a/example-listing-1
+...
+```
+
+(Real output depends entirely on what the configured search provider
+actually returns that day -- the numbers above are from a mocked test run,
+not a live scan, and are shown only to illustrate the report shape.)
+
+### What Phase 3 does NOT do
+
+- Does not scrape Trade Me, Facebook Marketplace, or any search engine's
+  HTML directly.
+- Does not fabricate comparable evidence, sold prices, or listings when a
+  provider is unconfigured or a request fails -- it returns nothing and
+  says so.
+- Does not let AI perform final profit/ROI/max-buy-price arithmetic --
+  that's still 100% Python (`scanner/valuation.py`, unchanged from Phase 2).
+  The Researcher/Trader AI passes only interpret evidence and can flag
+  specific comparables as unreliable; Python recomputes the valuation from
+  whatever evidence remains.
+- Does not yet have real eBay/Trade Me sold-price API integration (no
+  licensed API wired up) -- eBay evidence today comes from search-snippet
+  text signals only, which is weaker than a real sold-listings API and is
+  labelled accordingly (`evidence_type`).

@@ -22,26 +22,221 @@
     "Trailers & Caravans"
   ],
   "watch_categories": {
-    "Electronics & Tech": ["electronics", "tech", "bluetooth", "wireless", "camera", "speaker", "console", "gaming", "computer", "laptop"],
-    "Machinery & Tools": ["machinery", "power tool", "tools", "workshop", "equipment", "engine"],
-    "Sport & Leisure": ["sport", "leisure", "fitness", "outdoor", "camping", "fishing", "bike", "gym"],
-    "Jewellery & Watches": ["jewellery", "jewelry", "watch", "gold", "silver", "diamond"],
-    "Toys & Games": ["toys", "kids", "lego", "board game"],
-    "House & Garden": ["house", "garden", "furniture", "appliance", "whiteware", "kitchen"],
-    "Health & Beauty": ["health", "beauty", "cosmetic", "skincare"],
-    "Antiques & Collectables": ["antique", "vintage", "collectable", "collectible", "art"],
-    "Automotive Parts": ["car parts", "automotive", "tyres", "wheels"],
-    "Cars": ["ute", "car", "sedan", "hatchback", "suv", "vehicle"],
-    "Trucks & Machinery": ["truck", "tractor", "digger", "excavator", "forklift"],
-    "Motorbikes": ["motorbike", "motorcycle", "scooter", "dirt bike"],
-    "Trailers & Caravans": ["trailer", "caravan", "motorhome", "boat trailer"]
+    "Electronics & Tech": [
+      "electronics",
+      "tech",
+      "bluetooth",
+      "wireless",
+      "camera",
+      "speaker",
+      "console",
+      "gaming",
+      "computer",
+      "laptop"
+    ],
+    "Machinery & Tools": [
+      "machinery",
+      "power tool",
+      "tools",
+      "workshop",
+      "equipment",
+      "engine"
+    ],
+    "Sport & Leisure": [
+      "sport",
+      "leisure",
+      "fitness",
+      "outdoor",
+      "camping",
+      "fishing",
+      "bike",
+      "gym"
+    ],
+    "Jewellery & Watches": [
+      "jewellery",
+      "jewelry",
+      "watch",
+      "gold",
+      "silver",
+      "diamond"
+    ],
+    "Toys & Games": [
+      "toys",
+      "kids",
+      "lego",
+      "board game"
+    ],
+    "House & Garden": [
+      "house",
+      "garden",
+      "furniture",
+      "appliance",
+      "whiteware",
+      "kitchen"
+    ],
+    "Health & Beauty": [
+      "health",
+      "beauty",
+      "cosmetic",
+      "skincare"
+    ],
+    "Antiques & Collectables": [
+      "antique",
+      "vintage",
+      "collectable",
+      "collectible",
+      "art"
+    ],
+    "Automotive Parts": [
+      "car parts",
+      "automotive",
+      "tyres",
+      "wheels"
+    ],
+    "Cars": [
+      "ute",
+      "car",
+      "sedan",
+      "hatchback",
+      "suv",
+      "vehicle"
+    ],
+    "Trucks & Machinery": [
+      "truck",
+      "tractor",
+      "digger",
+      "excavator",
+      "forklift"
+    ],
+    "Motorbikes": [
+      "motorbike",
+      "motorcycle",
+      "scooter",
+      "dirt bike"
+    ],
+    "Trailers & Caravans": [
+      "trailer",
+      "caravan",
+      "motorhome",
+      "boat trailer"
+    ]
   },
   "max_items_per_category": 3,
   "min_items_per_category": 2,
   "min_group_size": 2,
   "similarity_threshold": 0.35,
   "max_price_nzd": 1500,
-  "exclude_keywords": ["damaged", "damage", "faulty", "broken", "not working", "non-runner", "non runner", "for parts", "parts only", "repair needed", "needs repair", "wrecked", "written off", "salvage", "not tested working", "no power", "won't start", "wont start", "does not work", "doesn't work", "cracked screen", "smashed"],
+  "exclude_keywords": [
+    "damaged",
+    "damage",
+    "faulty",
+    "broken",
+    "not working",
+    "non-runner",
+    "non runner",
+    "for parts",
+    "parts only",
+    "repair needed",
+    "needs repair",
+    "wrecked",
+    "written off",
+    "salvage",
+    "not tested working",
+    "no power",
+    "won't start",
+    "wont start",
+    "does not work",
+    "doesn't work",
+    "cracked screen",
+    "smashed"
+  ],
   "request_delay_seconds": 2.0,
-  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NZ-Reseller-Scanner/1.0 (personal use, low volume)"
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NZ-Reseller-Scanner/1.0 (personal use, low volume)",
+  "flip_hunter_mode": false,
+  "search_sources": {
+    "auction": true,
+    "ebay": true,
+    "marketplace": true,
+    "web_search": false
+  },
+  "bankroll": {
+    "starting_bankroll": 500,
+    "target_bankroll": 10000,
+    "minimum_profit": 75,
+    "minimum_roi_percent": 40,
+    "maximum_single_purchase_percent": 40
+  },
+  "cost_model": {
+    "buyer_premium_percent": 15.0,
+    "gst_percent": 0.0,
+    "selling_fee_percent": 9.0,
+    "payment_fee_percent": 2.9,
+    "shipping_flat": 15.0,
+    "packaging_flat": 5.0,
+    "repair_allowance_percent": 0.0,
+    "negotiation_allowance_percent": 0.0
+  },
+  "flip_score_weights": {
+    "expected_net_profit": 25,
+    "roi": 20,
+    "valuation_confidence": 20,
+    "liquidity": 15,
+    "price_confidence": 10,
+    "condition_risk": 5,
+    "capital_concentration": 5
+  },
+  "condition_risk_phrases": [
+    "untested",
+    "for parts",
+    "no charger",
+    "no battery",
+    "unknown condition",
+    "broken",
+    "damaged",
+    "cracked",
+    "water damaged",
+    "missing components",
+    "counterfeit",
+    "as-is",
+    "as is",
+    "spares or repair"
+  ],
+  "query_generation": {
+    "concepts": [
+      "bundle",
+      "lot",
+      "collection",
+      "clearance",
+      "moving house",
+      "unwanted",
+      "don't know",
+      "untested",
+      "parts",
+      "garage",
+      "estate",
+      "must sell",
+      "make an offer"
+    ]
+  },
+  "discovery": {
+    "enabled": true,
+    "max_queries_per_run": 15,
+    "max_results_per_query": 8,
+    "max_research_items": 5,
+    "prefer_purchase_price_below": 250,
+    "products": [
+      "Nintendo Switch",
+      "Canon camera",
+      "Nikon camera",
+      "Carrera Digital 132",
+      "Traxxas",
+      "Tamiya",
+      "LEGO",
+      "DJI drone",
+      "GoPro",
+      "Dyson vacuum",
+      "KitchenAid mixer",
+      "Makita tools"
+    ]
+  }
 }
