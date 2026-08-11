@@ -7,6 +7,7 @@ from unittest import mock
 
 from scanner.search.providers.tavily import TavilySearchProvider
 from scanner.search.providers.brave import BraveSearchProvider
+from scanner.search.providers.serpapi import SerpApiSearchProvider
 from scanner.search.web_search import WebSearchSource
 
 
@@ -149,6 +150,33 @@ class TestTavilyAuthentication(unittest.TestCase):
             self.assertEqual(body["search_depth"], "basic")
             self.assertEqual(body["max_results"], 5)
             self.assertEqual(body["include_domains"], ["trademe.co.nz"])
+
+
+class TestProvidersIgnoreUnsupportedKwargs(unittest.TestCase):
+    """Phase 4A: discover.py now always passes include_domains to
+    web_search.search(), which WebSearchSource forwards verbatim to
+    whichever provider is configured. Only Tavily supports domain
+    restriction -- Brave and SerpApi must not blow up with a TypeError
+    when they receive it anyway."""
+
+    def test_brave_ignores_include_domains(self):
+        with mock.patch.dict(os.environ, {"BRAVE_API_KEY": "fake-key"}, clear=True):
+            provider = BraveSearchProvider()
+            mock_resp = mock.Mock()
+            mock_resp.json.return_value = {"web": {"results": []}}
+            mock_resp.raise_for_status.return_value = None
+            with mock.patch("scanner.search.providers.brave.requests.get", return_value=mock_resp):
+                # Must not raise TypeError for the unexpected kwarg.
+                self.assertEqual(provider.search("query", include_domains=["trademe.co.nz"]), [])
+
+    def test_serpapi_ignores_include_domains(self):
+        with mock.patch.dict(os.environ, {"SERPAPI_API_KEY": "fake-key"}, clear=True):
+            provider = SerpApiSearchProvider()
+            mock_resp = mock.Mock()
+            mock_resp.json.return_value = {"organic_results": []}
+            mock_resp.raise_for_status.return_value = None
+            with mock.patch("scanner.search.providers.serpapi.requests.get", return_value=mock_resp):
+                self.assertEqual(provider.search("query", include_domains=["trademe.co.nz"]), [])
 
 
 if __name__ == "__main__":
