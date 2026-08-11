@@ -1,11 +1,11 @@
 # Project State
 
-_Last updated: 2026-08-11_
+_Last updated: 2026-08-12_
 
 ## Status
 
-- `main` @ `20bb595`. PRs #1-#6 merged, none open. 163/163 tests passing.
-- Phase 4A (discovery query-budget fix + NZ-local domain filtering, PR #5) is merged and structurally validated. It has **not** yet had a genuine live Tavily discovery run to confirm real-world behavior.
+- `main` @ `e7d8770`. PRs #1-#8 merged, none open. 163/163 tests passing.
+- **Phase 4A is validated end-to-end against live data.** GitHub Actions Run #25 on `main` succeeded with working Tavily auth: 15 queries across 12 products → 119 raw results → 105 unique (14 duplicates) → 84 rejected as non-individual-listing pages → 21 genuine individual listings passed URL validation → 5 reached product ID/research/valuation, all 5 correctly scored PASS. 0 eBay leakage throughout. Report auto-committed as `d7401ea`.
 
 ## Known issues
 
@@ -27,4 +27,4 @@ Sandbox has no GitHub push credentials (`git push` fails, no username). No authe
 
 ## Next action
 
-Run one genuine live Tavily discovery run to validate Phase 4A end-to-end before touching the query allocator or starting Phase 4B.
+Phase 4A is validated — no further validation run needed. Next: decide whether to fix the query-allocation known issue, start Phase 4B, or invest in the reporting/dashboard layer.
