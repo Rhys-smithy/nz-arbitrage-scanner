@@ -63,6 +63,40 @@ class TestProcessQueryResults(unittest.TestCase):
         self.assertEqual(entry["valid_individual_listings"], 0)
         self.assertEqual(unique_results, [])
 
+    def test_ebay_result_rejected_even_though_it_matches_listing_pattern(self):
+        # Regression test (PR #5 review): identify_marketplace()/
+        # is_individual_listing_url() still recognise eBay listing URLs as
+        # valid (that logic is shared with comparable_research.py, which
+        # legitimately wants eBay evidence) -- so without an explicit eBay
+        # check in _process_query_results, this URL would previously have
+        # counted as a "valid_individual_listing" and flowed into
+        # candidates/deduped. It must not, regardless of Tavily's
+        # include_domains enforcement.
+        results = [_result("https://www.ebay.com.au/itm/genuine-listing/123456789")]
+        seen = set()
+        entry, unique_results = _process_query_results("query", ["trademe.co.nz"], results, seen)
+
+        self.assertEqual(entry["raw_results"], 1)
+        self.assertEqual(entry["rejected_ebay"], 1)
+        self.assertEqual(entry["valid_individual_listings"], 0)
+        self.assertEqual(entry["unique_results"], 0)
+        self.assertEqual(unique_results, [])  # never reaches deduped/candidates
+
+    def test_ebay_result_does_not_block_a_later_duplicate_check(self):
+        # An eBay URL must not get added to seen_canonical -- it was
+        # rejected outright, not "seen" as a legitimate result -- so it
+        # must not suppress a later, different result.
+        seen = set()
+        _process_query_results(
+            "q1", [], [_result("https://www.ebay.com.au/itm/genuine-listing/123456789")], seen
+        )
+        entry2, unique_results2 = _process_query_results(
+            "q2", [], [_result("https://www.trademe.co.nz/a/marketplace/listing/999")], seen
+        )
+        self.assertEqual(entry2["unique_results"], 1)
+        self.assertEqual(entry2["valid_individual_listings"], 1)
+        self.assertEqual(len(unique_results2), 1)
+
 
 class _RunDiscoveryTestBase(unittest.TestCase):
     """Shared setup mocking out everything downstream of the search loop
@@ -137,6 +171,23 @@ class TestRunDiscoveryDistributesQueryBudget(_RunDiscoveryTestBase):
                 if product in query:
                     queried_products.add(product)
         self.assertEqual(queried_products, set(products))
+
+
+class TestRunDiscoveryRejectsEbayResults(_RunDiscoveryTestBase):
+    """End-to-end regression test (PR #5 review): an eBay listing returned
+    by the search provider -- however it got past include_domains -- must
+    never become an opportunity. If this weren't fixed, the eBay result
+    would pass is_individual_listing_url(), become the sole candidate, and
+    flow into the per-candidate valuation loop below."""
+
+    def test_ebay_result_never_becomes_an_opportunity(self):
+        self.mock_source.search.return_value = [
+            _result("https://www.ebay.com.au/itm/genuine-listing/123456789"),
+        ]
+
+        opportunities = run_discovery(self._config())
+
+        self.assertEqual(opportunities, [])
 
 
 if __name__ == "__main__":

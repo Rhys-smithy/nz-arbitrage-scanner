@@ -48,6 +48,17 @@ DEFAULT_DISCOVERY_DOMAINS = [
 
 _EBAY_DOMAINS = {"ebay.com", "www.ebay.com", "ebay.com.au", "www.ebay.com.au"}
 
+# Defense in depth (PR #5 review): the include_domains request filter above
+# is enforced by the search provider, not by us -- it's not a guarantee.
+# identify_marketplace()/is_individual_listing_url() in search/util.py still
+# recognise eBay listing URLs as valid (that logic is shared with
+# comparable_research.py, where eBay evidence IS wanted), so without this
+# explicit check here, an eBay result that slipped past include_domains
+# (provider quirk, redirect, or a future config override) would sail
+# straight through as a "valid individual listing" and become a buyable
+# opportunity -- exactly what discovery must never do.
+_EBAY_MARKETPLACES = {"eBay", "eBay AU"}
+
 
 def _process_query_results(
     query: str,
@@ -68,12 +79,21 @@ def _process_query_results(
     valid_count = 0
     duplicate_count = 0
     not_listing_count = 0
+    ebay_count = 0
     for r in results:
         key = canonicalize_url(r.url)
         if key in seen_canonical:
             duplicate_count += 1
             continue
         seen_canonical.add(key)
+
+        if identify_marketplace(r.url) in _EBAY_MARKETPLACES:
+            # Reject outright -- never added to unique_results, so it can
+            # never reach `deduped`/`candidates` in run_discovery below,
+            # regardless of what include_domains asked the provider for.
+            ebay_count += 1
+            continue
+
         unique_results.append(r)
         if is_individual_listing_url(r.url):
             valid_count += 1
@@ -88,6 +108,7 @@ def _process_query_results(
         "valid_individual_listings": valid_count,
         "rejected_duplicate": duplicate_count,
         "rejected_not_individual_listing": not_listing_count,
+        "rejected_ebay": ebay_count,
     }
     return entry, unique_results
 
@@ -154,7 +175,8 @@ def run_discovery(config: dict) -> list[Opportunity]:
             f"raw={log_entry['raw_results']} unique={log_entry['unique_results']} "
             f"valid_listings={log_entry['valid_individual_listings']} "
             f"rejected(duplicate={log_entry['rejected_duplicate']}, "
-            f"not_individual_listing={log_entry['rejected_not_individual_listing']})"
+            f"not_individual_listing={log_entry['rejected_not_individual_listing']}, "
+            f"ebay={log_entry['rejected_ebay']})"
         )
 
     # Search snippets rarely carry a structured price field -- best-effort
