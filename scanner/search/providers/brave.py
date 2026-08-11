@@ -34,7 +34,12 @@ class BraveSearchProvider(SearchProvider):
         location: str = "New Zealand",
         freshness: str | None = None,
         max_results: int = 10,
+        **_unsupported,
     ) -> list[SearchResult]:
+        # Accepts (and ignores) provider-specific kwargs like include_domains
+        # that only Tavily supports -- WebSearchSource forwards whatever the
+        # caller passes through to whichever provider is configured, and
+        # Brave's API has no equivalent domain-restriction param.
         if not self.is_configured():
             print("[search/brave] BRAVE_API_KEY not set -- skipping (no results fabricated).")
             return []

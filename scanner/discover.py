@@ -21,9 +21,9 @@ from scanner.liquidity import estimate_liquidity
 from scanner.models import Opportunity, ProductIdentification
 from scanner.notifier import build_flip_alert, send_telegram_message
 from scanner.product_id import detect_condition_risk, identify_product
-from scanner.query_generator import generate_discovery_queries
+from scanner.query_generator import allocate_discovery_queries
 from scanner.researcher import research
-from scanner.search.util import dedupe_results, identify_marketplace, is_individual_listing_url
+from scanner.search.util import canonicalize_url, identify_marketplace, is_individual_listing_url
 from scanner.search.web_search import WebSearchSource
 from scanner.search_stats import (
     extract_concept_from_query,
@@ -33,6 +33,63 @@ from scanner.search_stats import (
 )
 from scanner.trader import trader_review
 from scanner.valuation import apply_valuation
+
+# Opportunity discovery is NZ-local only (spec: no eBay here -- eBay stays
+# usable as *comparable evidence* in comparable_research.py, a separate
+# pipeline stage, but must never surface as a buyable opportunity). These
+# are the domains this repo already treats as real marketplaces with a
+# working individual-listing pattern in search/util.py.
+DEFAULT_DISCOVERY_DOMAINS = [
+    "trademe.co.nz",
+    "turners.co.nz",
+    "thorntons.net.nz",
+    "mainlandauctions.nz",
+]
+
+_EBAY_DOMAINS = {"ebay.com", "www.ebay.com", "ebay.com.au", "www.ebay.com.au"}
+
+
+def _process_query_results(
+    query: str,
+    domains: list[str],
+    results: list,
+    seen_canonical: set,
+) -> tuple[dict, list]:
+    """Classifies one query's raw results against the run's running
+    canonical-URL dedup set (updated in place) and returns a per-query log
+    entry plus the subset of results that were newly unique.
+
+    Kept as a small pure-ish helper (only side effect is mutating the
+    passed-in `seen_canonical` set) so query-level logging/rejection
+    counting is unit-testable without exercising the whole discovery
+    pipeline (product ID, valuation, etc).
+    """
+    unique_results = []
+    valid_count = 0
+    duplicate_count = 0
+    not_listing_count = 0
+    for r in results:
+        key = canonicalize_url(r.url)
+        if key in seen_canonical:
+            duplicate_count += 1
+            continue
+        seen_canonical.add(key)
+        unique_results.append(r)
+        if is_individual_listing_url(r.url):
+            valid_count += 1
+        else:
+            not_listing_count += 1
+
+    entry = {
+        "query": query,
+        "domains": list(domains),
+        "raw_results": len(results),
+        "unique_results": len(unique_results),
+        "valid_individual_listings": valid_count,
+        "rejected_duplicate": duplicate_count,
+        "rejected_not_individual_listing": not_listing_count,
+    }
+    return entry, unique_results
 
 
 def run_discovery(config: dict) -> list[Opportunity]:
@@ -58,19 +115,31 @@ def run_discovery(config: dict) -> list[Opportunity]:
     concepts = query_gen_cfg.get("concepts", [])
     products = discovery_cfg.get("products", [])
 
-    queries = generate_discovery_queries(
+    # Domain allowlist actually restricts Tavily's results server-side
+    # (include_domains), replacing the old "site:trademe.co.nz" literal
+    # query text, which is not a real filter for Tavily and let eBay/other
+    # off-target domains flood the 15-query budget (Run #23). Config can
+    # override the list, but eBay is stripped out unconditionally --
+    # opportunity discovery must stay NZ-local, never eBay.
+    discovery_domains = discovery_cfg.get("include_domains") or DEFAULT_DISCOVERY_DOMAINS
+    discovery_domains = [d for d in discovery_domains if d.lower() not in _EBAY_DOMAINS]
+
+    queries = allocate_discovery_queries(
         products=products,
         concepts=concepts,
-        marketplace_sites=["site:trademe.co.nz"],
-    )[:max_queries]
+        max_queries=max_queries,
+    )
 
-    print(f"[discover] running {len(queries)} discovery quer{'y' if len(queries)==1 else 'ies'}...")
+    print(f"[discover] running {len(queries)} discovery quer{'y' if len(queries)==1 else 'ies'} "
+          f"across {len(products)} product(s), restricted to domains: {', '.join(discovery_domains)}")
 
     stats = load_stats()
     discovered_store = load_discovered()
     all_results = []
+    deduped = []
+    seen_canonical: set = set()
     for query in queries:
-        results = web_search.search(query, max_results=max_results)
+        results = web_search.search(query, max_results=max_results, include_domains=discovery_domains)
         concept = extract_concept_from_query(query, concepts)
         # Record every result's discovery under this query's concept for
         # later query-strategy analysis, even before we know if it's profitable.
@@ -78,7 +147,15 @@ def run_discovery(config: dict) -> list[Opportunity]:
             r._discovery_concept = concept  # lightweight tag, not part of SearchResult schema
         all_results.extend(results)
 
-    deduped = dedupe_results(all_results)
+        log_entry, unique_results = _process_query_results(query, discovery_domains, results, seen_canonical)
+        deduped.extend(unique_results)
+        print(
+            f"[discover]   query={log_entry['query']!r} "
+            f"raw={log_entry['raw_results']} unique={log_entry['unique_results']} "
+            f"valid_listings={log_entry['valid_individual_listings']} "
+            f"rejected(duplicate={log_entry['rejected_duplicate']}, "
+            f"not_individual_listing={log_entry['rejected_not_individual_listing']})"
+        )
 
     # Search snippets rarely carry a structured price field -- best-effort
     # extract one from title/description text so bankroll-aware sorting

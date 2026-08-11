@@ -33,7 +33,10 @@ class SerpApiSearchProvider(SearchProvider):
         location: str = "New Zealand",
         freshness: str | None = None,
         max_results: int = 10,
+        **_unsupported,
     ) -> list[SearchResult]:
+        # Accepts (and ignores) provider-specific kwargs like include_domains
+        # that only Tavily supports -- see brave.py for the same note.
         if not self.is_configured():
             print("[search/serpapi] SERPAPI_API_KEY not set -- skipping (no results fabricated).")
             return []
