@@ -16,6 +16,13 @@ Build a reliable NZ resale/arbitrage scanner: grow NZ$500 → NZ$10,000 by buyin
 - Full setup, config (`config.json`) reference, and pipeline/phase details: `README.md` — don't duplicate that here.
 - Current state, known issues, priorities: `PROJECT_STATE.md`.
 
+## Tooling
+
+* When browser interaction is useful or required, use the connected Claude Chrome browser to inspect/interact with live websites — don't assume API/MCP access is available instead.
+* For GitHub tasks: first check whether Claude Chrome is available and logged into GitHub. If so, use it for GitHub UI actions (creating PRs, reviewing changes, merging, checking repo state).
+* Don't assume the GitHub MCP/connector is available just because GitHub is reachable through Chrome — they are separate capabilities.
+* Verify important actions directly against the live result before claiming they succeeded.
+
 ## Pipeline
 
 SEARCH → LISTING VALIDATION → PRODUCT ID → COMPARABLE RESEARCH → VALUATION → COSTS → MAX BUY → PROFIT/ROI → RISK/LIQUIDITY → FLIP SCORE → BUY/WATCH/PASS
