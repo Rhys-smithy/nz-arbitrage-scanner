@@ -2,33 +2,29 @@
 
 _Last updated: 2026-08-11_
 
-## Current status
+## Status
 
-- `main` is at commit `942f67f` and unaffected by any work below.
-- **PR #5** (draft, not merged): `phase-4a-discovery-query-fix` -> `main`.
-  Fixes the Run #23 discovery bug (15-query budget exhausted on the first
-  configured product; `site:` text wasn't a real Tavily filter). Adds
-  `include_domains`-based NZ-local domain restriction, per-query logging,
-  and tests. Contains commits `0180fe9` (the original fix) and `e3339cf`
-  (eBay defense-in-depth, added after review). Both are pushed. 163/163
-  tests passing.
-- **PR #6** (draft, not merged): `docs/add-project-state` -> `main`. Adds
-  this file. Documentation only.
-- Query-allocation strategy (round-robin across products) still weights
-  bare-product queries over concept/bargain-signal queries within the
-  budget -- flagged in PR #5's review as a non-blocking future
-  optimization.
+- `main` @ `20bb595`. PRs #1-#6 merged, none open. 163/163 tests passing.
+- Phase 4A (discovery query-budget fix + NZ-local domain filtering, PR #5) is merged and structurally validated. It has **not** yet had a genuine live Tavily discovery run to confirm real-world behavior.
 
-## Environment constraint
+## Known issues
 
-This Claude sandbox clone has no GitHub push credentials and no GitHub
-API access (`api.github.com` is network-blocked). Pushing requires: Claude
-creates a `git bundle` file, the user downloads it and gets its real path
-(Explorer "Show in folder" -> "Copy as path"), then runs
-`git fetch <bundle> <branch>:<branch>` + `git push origin <branch>` from
-their own machine, which already has push access. This applies to every
-push/PR-update until a real credential path is set up.
+- Query-allocation (round-robin across products) over-weights bare-product queries vs. concept/bargain-signal queries within budget. Flagged in PR #5 review as non-blocking; not yet an approved change.
 
-## Next step
+## Priorities
 
-- Review/merge PR #5 and PR #6 once satisfied.
+1. Find genuine NZ resale opportunities.
+2. Improve valuation accuracy.
+3. Improve comparable evidence.
+4. Reduce false positives.
+5. Improve search efficiency.
+6. Protect the $500 bankroll.
+7. Convenience/features last.
+
+## Environment
+
+Sandbox has no GitHub push credentials (`git push` fails, no username). No authenticated write path is currently active — see chat for options if this needs resolving.
+
+## Next action
+
+Run one genuine live Tavily discovery run to validate Phase 4A end-to-end before touching the query allocator or starting Phase 4B.
