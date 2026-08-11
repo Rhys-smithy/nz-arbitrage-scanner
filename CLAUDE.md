@@ -1,31 +1,20 @@
 # NZ Arbitrage Scanner — Claude Instructions
 
+## Session Start
+
+Read this file and `PROJECT_STATE.md` first. Inspect code only as needed for the task at hand. Don't reconstruct prior chat history from memory — Git history and these two files are the source of truth.
+
 ## Mission
 
-Build a reliable NZ resale/arbitrage scanner with the goal of growing NZ$500 → NZ$10,000 through buying and reselling physical goods.
+Build a reliable NZ resale/arbitrage scanner: grow NZ$500 → NZ$10,000 by buying and reselling physical goods.
 
-## Rules
+## Architecture
 
-* Inspect existing code before changing it.
-* Reuse working code; don't rebuild unnecessarily.
-* Make small, focused changes.
-* Don't modify unrelated functionality.
-* Protect existing auction scanners, reports, Telegram, GitHub Actions, Phase 2 valuation, bankroll and Flip Score.
-* Never fabricate listings, prices, sold data or comparable evidence.
-* Clearly distinguish SOLD, ASKING, RETAIL and OTHER evidence.
-* AI researches/reasons; Python performs all financial calculations.
-* Be conservative with valuations and confidence.
-* Genuine individual listings only may enter the opportunity pipeline.
-* Reject category/search pages, seller pages, YouTube, news, blogs, manufacturer pages and generic retailer pages as opportunities.
-* Retail/product pages may be used as comparable/research evidence.
-* Never bypass CAPTCHAs, authentication, bot protection or marketplace access controls.
-* Prefer free services. Do not introduce paid APIs without first explaining the free alternatives, cost and benefit.
-* Avoid unnecessary API calls; filter cheaply before expensive AI/research calls.
-* Never commit or expose secrets.
-* Mock external APIs in tests.
-* Add regression tests for bug fixes.
-* Never weaken tests just to make them pass.
-* For significant work, use a separate branch and focused commit. Do not merge/push to `main` unless explicitly instructed.
+- Entry point: `main.py` (`--mode scan` default; `--mode discover` for Phase 3 web-search discovery).
+- Core logic: `scanner/` (scrapers in `scanner/scrapers/`, search providers in `scanner/search/`).
+- Tests: `tests/`.
+- Full setup, config (`config.json`) reference, and pipeline/phase details: `README.md` — don't duplicate that here.
+- Current state, known issues, priorities: `PROJECT_STATE.md`.
 
 ## Pipeline
 
@@ -33,53 +22,33 @@ SEARCH → LISTING VALIDATION → PRODUCT ID → COMPARABLE RESEARCH → VALUATI
 
 Keep opportunity sources separate from research/comparable sources.
 
+## Rules
+
+* Inspect existing code before changing it; reuse working code; make small, focused changes; don't touch unrelated functionality.
+* Protect existing scanners, reports, Telegram, GitHub Actions, Phase 2 valuation, bankroll, and Flip Score.
+* Never fabricate listings, prices, sold data, or comparable evidence. Clearly distinguish SOLD, ASKING, RETAIL, and OTHER evidence.
+* AI researches/reasons; Python performs all financial calculations. Be conservative with valuations and confidence.
+* Genuine individual listings only enter the opportunity pipeline — reject category/search pages, seller pages, YouTube, news, blogs, manufacturer pages, and generic retailer pages. Retail/product pages are fine as comparable/research evidence.
+* Never bypass CAPTCHAs, authentication, bot protection, or marketplace access controls.
+* Prefer free services; explain the free alternatives and cost/benefit before introducing a paid API.
+* Filter cheaply before making expensive AI/research calls.
+* Never commit or expose secrets. Mock external APIs in tests.
+* Add a regression test for every bug fix; never weaken a test just to make it pass.
+* Significant work goes on a separate branch with a focused commit. Never merge/push to `main` unless explicitly instructed.
+
 ## Decision Philosophy
 
-Prefer fewer high-confidence opportunities over lots of weak ones.
+Prefer fewer high-confidence opportunities over many weak ones (a likely $100 profit at high confidence beats a theoretical $250 at low confidence). Bankroll is $500, so capital concentration matters.
 
-A likely $100 profit with high confidence is better than a theoretical $250 profit with low confidence.
+## Process
 
-The starting bankroll is only $500, so capital concentration matters.
-
-## Bug Fix Process
-
-1. Reproduce.
-2. Find root cause.
-3. Make the smallest appropriate fix.
-4. Add a regression test.
-5. Run targeted tests.
-6. Run the full suite when appropriate.
-
-## Feature Process
-
-Before coding:
-
-* Check whether it already exists.
-* Identify the smallest integration point.
-* Consider API cost and failure modes.
-* Implement only what is required.
+**Bug fix:** reproduce → find root cause → smallest fix → regression test → run targeted tests → full suite when appropriate.
+**Feature:** check it doesn't already exist → find smallest integration point → consider API cost/failure modes → implement only what's required.
 
 ## Responses
 
-Keep responses concise.
+Keep responses concise. Report only: changes made, tests passed, important limitations, decisions/input required. If blocked, state the exact blocker and the smallest decision needed.
 
-After work, report only:
+---
 
-* changes made
-* tests passed
-* important limitations
-* decisions/input required
-
-If blocked, state the exact blocker and the smallest required decision.
-
-## Current Priority
-
-1. Find genuine NZ resale opportunities.
-2. Improve valuation accuracy.
-3. Improve comparable evidence.
-4. Reduce false positives.
-5. Improve search efficiency.
-6. Protect the $500 bankroll.
-7. Add convenience/features last.
-
-This is a real-money decision-support system. When uncertain: be conservative, show the evidence, and say so.
+Real-money decision-support system. When uncertain: be conservative, show the evidence, and say so.
