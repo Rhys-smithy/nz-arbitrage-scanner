@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "run_timestamp": "2026-08-12T11:42:11+00:00",
+  "mode": "discover",
+  "queries_run": 15,
+  "candidates_found": 4,
+  "candidates_verified": 0,
+  "candidates_verification_dropped": 4,
+  "opportunity_count": 0,
+  "decision_counts": {},
+  "opportunities": []
+}
