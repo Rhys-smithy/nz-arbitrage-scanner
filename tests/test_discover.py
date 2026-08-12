@@ -126,11 +126,18 @@ class _RunDiscoveryTestBase(unittest.TestCase):
             mock.patch("scanner.discover.load_stats", return_value={}),
             mock.patch("scanner.discover.save_discovered"),
             mock.patch("scanner.discover.load_discovered", return_value={}),
+            mock.patch(
+                "scanner.discover.write_discovery_report",
+                return_value=("reports/discovery_test.json", {}),
+            ),
+            mock.patch("scanner.discover.update_discovery_index"),
             mock.patch("scanner.discover.WebSearchSource"),
         ]
         self.mocks = [p.start() for p in patches]
         for p in patches:
             self.addCleanup(p.stop)
+        self.mock_write_discovery_report = self.mocks[4]
+        self.mock_update_discovery_index = self.mocks[5]
         self.mock_source_cls = self.mocks[-1]
         self.mock_source = self.mock_source_cls.return_value
         self.mock_source.available = True
@@ -259,6 +266,62 @@ class TestRunDiscoveryVerificationGate(_RunDiscoveryTestBase):
         output = buf.getvalue()
         self.assertIn("verification:", output)
         self.assertIn("1 dropped", output)
+
+
+class TestRunDiscoveryPersistsReport(_RunDiscoveryTestBase):
+    """Phase 4B.2: every run_discovery() call must persist its results via
+    write_discovery_report()/update_discovery_index(), even when zero
+    opportunities are found -- the run itself (queries/candidates/
+    verification counts) is still worth recording for debugging."""
+
+    def test_empty_run_still_persists_a_report(self):
+        run_discovery(self._config())
+
+        self.mock_write_discovery_report.assert_called_once()
+        opportunities_arg, run_meta_arg = self.mock_write_discovery_report.call_args[0]
+        self.assertEqual(opportunities_arg, [])
+        self.assertEqual(run_meta_arg["opportunity_count"], 0)
+        self.assertEqual(run_meta_arg["decision_counts"], {})
+        self.assertEqual(run_meta_arg["mode"], "discover")
+        self.mock_update_discovery_index.assert_called_once()
+        # update_discovery_index must be called with exactly what
+        # write_discovery_report returned, not recomputed.
+        index_args = self.mock_update_discovery_index.call_args[0]
+        self.assertEqual(index_args, ("reports/discovery_test.json", {}))
+
+    def test_run_meta_reflects_verification_counts_and_decisions(self):
+        from scanner.models import ProductIdentification, ResaleValuation
+
+        self.mock_source.search.return_value = [
+            _result("https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/1/"),
+            _result("https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/2/"),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            mock_verify.side_effect = [
+                mock.Mock(status="verified", price=100.0, reason=""),
+                mock.Mock(status="unavailable", price=None, reason="no price"),
+            ]
+            with mock.patch("scanner.discover.identify_product", return_value=ProductIdentification()):
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch(
+                            "scanner.discover.trader_review",
+                            return_value=(ResaleValuation(), {"ran": False}),
+                        ):
+                            opportunities = run_discovery(self._config())
+
+        # No quick_sale_low on the fallback ResaleValuation() -> decide()
+        # returns PASS ("Missing price or valuation data") for the one
+        # candidate that survived verification.
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0].decision, "PASS")
+
+        _, run_meta_arg = self.mock_write_discovery_report.call_args[0]
+        self.assertEqual(run_meta_arg["candidates_found"], 2)
+        self.assertEqual(run_meta_arg["candidates_verified"], 1)
+        self.assertEqual(run_meta_arg["candidates_verification_dropped"], 1)
+        self.assertEqual(run_meta_arg["opportunity_count"], 1)
+        self.assertEqual(run_meta_arg["decision_counts"], {"PASS": 1})
 
 
 if __name__ == "__main__":
