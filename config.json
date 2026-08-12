@@ -202,6 +202,7 @@
     "spares or repair"
   ],
   "query_generation": {
+    "bare_product_min_ratio": 0.15,
     "concepts": [
       "bundle",
       "lot",
