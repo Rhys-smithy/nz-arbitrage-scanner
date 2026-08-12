@@ -4,12 +4,13 @@ _Last updated: 2026-08-12_
 
 ## Status
 
-- `main` @ `e7d8770`. PRs #1-#8 merged, none open. 163/163 tests passing.
+- `main` @ `4195ef7`. PRs #1-#10 merged, none open. 168/168 tests passing.
 - **Phase 4A is validated end-to-end against live data.** GitHub Actions Run #25 on `main` succeeded with working Tavily auth: 15 queries across 12 products → 119 raw results → 105 unique (14 duplicates) → 84 rejected as non-individual-listing pages → 21 genuine individual listings passed URL validation → 5 reached product ID/research/valuation, all 5 correctly scored PASS. 0 eBay leakage throughout. Report auto-committed as `d7401ea`.
+- PR #10 (`49708a7`) resolved the discovery query-allocation known issue: rebalanced `allocate_discovery_queries()` toward concept/bargain-signal queries (round 0 no longer 100% bare-product) and added daily product/concept rotation.
 
 ## Known issues
 
-- Query-allocation (round-robin across products) over-weights bare-product queries vs. concept/bargain-signal queries within budget. Flagged in PR #5 review as non-blocking; not yet an approved change.
+None currently open.
 
 ## Priorities
 
@@ -27,4 +28,4 @@ Sandbox has no GitHub push credentials (`git push` fails, no username). No authe
 
 ## Next action
 
-Phase 4A is validated — no further validation run needed. Next: decide whether to fix the query-allocation known issue, start Phase 4B, or invest in the reporting/dashboard layer.
+Phase 4A is validated and the query-allocation known issue is resolved. Next: decide whether to start Phase 4B or invest in the reporting/dashboard layer.
