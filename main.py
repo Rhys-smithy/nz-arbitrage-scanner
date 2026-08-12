@@ -292,9 +292,20 @@ def main():
     config = load_config()
 
     if args.mode == "discover":
+        from scanner.deal_queue_report import render_latest_deal_queue
         from scanner.discover import print_top_opportunities, run_discovery, send_discovery_alerts
 
         opportunities = run_discovery(config)
+
+        # run_discovery() already persisted this run's Opportunity results
+        # (scanner/discovery_report.py) regardless of whether any were
+        # found -- regenerate the Deal Queue view from that same persisted
+        # data so it always reflects the latest run, including a 0-result
+        # run. Read-only over already-written files; never recomputes.
+        deal_queue_path = render_latest_deal_queue()
+        if deal_queue_path:
+            print(f"[main] wrote deal queue view to {deal_queue_path}")
+
         if not opportunities:
             print("[main] discovery mode found no opportunities this run.")
             return
