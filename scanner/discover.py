@@ -12,6 +12,8 @@ it has its own freshness store (scanner/discovery_store.py).
 """
 from __future__ import annotations
 
+from datetime import date
+
 from scanner.bundle import value_bundle
 from scanner.comparable_research import extract_price, research_comparables
 from scanner.discovery_store import load_discovered, record_sightings, save_discovered
@@ -134,7 +136,18 @@ def run_discovery(config: dict) -> list[Opportunity]:
 
     query_gen_cfg = config.get("query_generation", {})
     concepts = query_gen_cfg.get("concepts", [])
+    bare_product_min_ratio = query_gen_cfg.get("bare_product_min_ratio", 0.15)
     products = discovery_cfg.get("products", [])
+
+    # Rotates which products/concepts get priority in the round-robin below
+    # (see allocate_discovery_queries docstring) so coverage cycles across
+    # the full product/concept lists over successive days instead of always
+    # favouring whatever's first in config.json. Config can pin a fixed
+    # value (useful for debugging a specific day's behaviour); defaults to
+    # today's date so it changes daily on its own.
+    rotation_seed = discovery_cfg.get("rotation_seed")
+    if rotation_seed is None:
+        rotation_seed = date.today().toordinal()
 
     # Domain allowlist actually restricts Tavily's results server-side
     # (include_domains), replacing the old "site:trademe.co.nz" literal
@@ -149,6 +162,8 @@ def run_discovery(config: dict) -> list[Opportunity]:
         products=products,
         concepts=concepts,
         max_queries=max_queries,
+        bare_product_min_ratio=bare_product_min_ratio,
+        seed=rotation_seed,
     )
 
     print(f"[discover] running {len(queries)} discovery quer{'y' if len(queries)==1 else 'ies'} "
