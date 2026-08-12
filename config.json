@@ -240,7 +240,10 @@
       "Makita tools"
     ],
     "include_domains": [
-      "turners.co.nz"
+      "trademe.co.nz",
+      "turners.co.nz",
+      "thorntons.net.nz",
+      "mainlandauctions.nz"
     ]
   }
 }
