@@ -127,3 +127,24 @@ class Opportunity:
     decision_reasons: list[str] = field(default_factory=list)
 
     capital_concentration_pct: Optional[float] = None
+
+
+@dataclass
+class VerifiedListing:
+    """Phase 4B.1: result of re-fetching a discovery candidate's actual
+    source (its own detail page and/or the catalog/division page it comes
+    from) before any AI/valuation work is allowed to trust its price or
+    condition. A Tavily search-snippet price is never authoritative on its
+    own -- see scanner/listing_verification.py.
+
+    Core rule: if `status != "verified"`, the candidate this describes must
+    not proceed to product identification, comparable research, valuation,
+    or scoring (enforced in scanner/discover.py).
+    """
+
+    status: str  # "verified" / "unavailable" / "unsupported"
+    price: Optional[float] = None
+    condition_text: str = ""
+    is_live: bool = False
+    reason: str = ""  # why status isn't "verified"; always set for non-"verified"
+    raw_fields: dict = field(default_factory=dict)  # source-specific extras for debugging/logging

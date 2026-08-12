@@ -190,5 +190,76 @@ class TestRunDiscoveryRejectsEbayResults(_RunDiscoveryTestBase):
         self.assertEqual(opportunities, [])
 
 
+class TestRunDiscoveryVerificationGate(_RunDiscoveryTestBase):
+    """Phase 4B.1: a candidate must never reach product ID / comparable
+    research / valuation / scoring unless listing_verification.verify_listing()
+    reports it as "verified". These tests mock verify_listing itself (its own
+    per-source behaviour is covered by tests/test_listing_verification.py) and
+    check the gate in run_discovery() actually enforces the drop."""
+
+    def setUp(self):
+        super().setUp()
+        self.mock_source.search.return_value = [
+            _result("https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/28374370/"),
+        ]
+
+    def test_unverified_candidate_never_reaches_identify_product(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables") as mock_research:
+                    mock_verify.return_value = mock.Mock(status="unavailable", price=None, reason="no price")
+                    opportunities = run_discovery(self._config())
+
+        self.assertEqual(opportunities, [])
+        mock_identify.assert_not_called()
+        mock_research.assert_not_called()
+
+    def test_unsupported_candidate_never_reaches_identify_product(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                mock_verify.return_value = mock.Mock(status="unsupported", price=None, reason="robots.txt disallows")
+                opportunities = run_discovery(self._config())
+
+        self.assertEqual(opportunities, [])
+        mock_identify.assert_not_called()
+
+    def test_verified_candidate_reaches_identify_product_with_authoritative_price(self):
+        from scanner.models import ProductIdentification, ResaleValuation
+
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.return_value = mock.Mock(
+                                status="verified", price=199.0, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            opportunities = run_discovery(self._config())
+
+        mock_identify.assert_called_once()
+        self.assertEqual(len(opportunities), 1)
+        # The snippet-derived price (None, from _result()'s default) must
+        # have been overwritten with the verified, authoritative price
+        # before identify_product/valuation ran on the candidate.
+        self.assertEqual(opportunities[0].current_price, 199.0)
+
+    def test_verification_dropped_count_is_logged(self):
+        import io
+        import contextlib
+
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product"):
+                mock_verify.return_value = mock.Mock(status="unavailable", price=None, reason="no price")
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    run_discovery(self._config())
+
+        output = buf.getvalue()
+        self.assertIn("verification:", output)
+        self.assertIn("1 dropped", output)
+
+
 if __name__ == "__main__":
     unittest.main()
