@@ -20,6 +20,7 @@ from scanner.discovery_store import load_discovered, record_sightings, save_disc
 from scanner.evidence import classify_evidence
 from scanner.flip_score import score_and_decide
 from scanner.liquidity import estimate_liquidity
+from scanner.listing_verification import VerificationCache, verify_listing
 from scanner.models import Opportunity, ProductIdentification
 from scanner.notifier import build_flip_alert, send_telegram_message
 from scanner.product_id import detect_condition_risk, identify_product
@@ -225,6 +226,36 @@ def run_discovery(config: dict) -> list[Opportunity]:
         )
     )
     candidates = candidates[:max_research]
+
+    # Phase 4B.1: a candidate's price (and everything downstream of it --
+    # product ID, comparable research, valuation, Flip Score) must never be
+    # trusted from Tavily's search-snippet text alone. Re-fetch each
+    # candidate's actual authoritative source and drop anything that can't
+    # be verified *before* any AI/research/valuation work runs on it -- see
+    # scanner/listing_verification.py for what "verified" means per source.
+    user_agent = config.get("user_agent", "NZ-Reseller-Scanner/1.0")
+    request_delay = config.get("request_delay_seconds", 2.0)
+    verification_cache = VerificationCache(user_agent, request_delay)
+
+    verified_candidates = []
+    verification_dropped = 0
+    for candidate in candidates:
+        verified = verify_listing(candidate.url, verification_cache)
+        if verified.status != "verified":
+            verification_dropped += 1
+            print(
+                f"[discover]   verification dropped: status={verified.status} "
+                f"url={candidate.url!r} reason={verified.reason!r}"
+            )
+            continue
+        candidate.price = verified.price  # overwrite snippet-derived price with the authoritative one
+        verified_candidates.append(candidate)
+
+    print(
+        f"[discover] verification: {len(verified_candidates)} verified, "
+        f"{verification_dropped} dropped (of {len(candidates)} candidates)."
+    )
+    candidates = verified_candidates
 
     api_key = config.get("anthropic_api_key", "")
     bankroll_cfg = config.get("bankroll", {})
