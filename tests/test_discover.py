@@ -14,7 +14,7 @@ from scanner.discover import (
     run_discovery,
 )
 from scanner.search.base import SearchResult
-from scanner.models import ProductIdentification, ResaleValuation
+from scanner.models import ComparableEvidence, ProductIdentification, ResaleValuation
 
 
 def _result(url, title="Item", price=None):
@@ -527,7 +527,7 @@ class TestRunDiscoveryVerificationGate(_RunDiscoveryTestBase):
         self.assertIn("0 dropped", output)
 
     def test_verified_opportunity_defaults_to_verified_status(self):
-        from scanner.models import ProductIdentification, ResaleValuation
+        from scanner.models import ComparableEvidence, ProductIdentification, ResaleValuation
 
         with mock.patch("scanner.discover.verify_listing") as mock_verify:
             with mock.patch("scanner.discover.identify_product") as mock_identify:
@@ -545,7 +545,7 @@ class TestRunDiscoveryVerificationGate(_RunDiscoveryTestBase):
         self.assertEqual(opportunities[0].verification_status, "verified")
 
     def test_verified_candidate_reaches_identify_product_with_authoritative_price(self):
-        from scanner.models import ProductIdentification, ResaleValuation
+        from scanner.models import ComparableEvidence, ProductIdentification, ResaleValuation
 
         with mock.patch("scanner.discover.verify_listing") as mock_verify:
             with mock.patch("scanner.discover.identify_product") as mock_identify:
@@ -1147,6 +1147,98 @@ class TestRunDiscoveryUnsupportedSourceBypassesResearchCap(_RunDiscoveryTestBase
 
         self.assertEqual(captured_meta["candidates_found"], 3)
         self.assertEqual(captured_meta["candidates_selected_for_research"], 3)
+
+
+class TestRunDiscoveryPassesIdentificationConfidenceToTrader(_RunDiscoveryTestBase):
+    """Phase 4B.5 bug fix regression: trader_review must receive the real
+    identify_product() confidence, and it must actually move the resulting
+    valuation confidence -- previously this signal never reached
+    build_valuation_from_evidence() at all (trader.py derived it from its
+    own reject_valuation verdict instead). trader_review is deliberately
+    left unmocked here (api_key is empty in _config(), so it safely takes
+    the no-network fallback path) so the real wiring is exercised
+    end-to-end."""
+
+    TURNERS_URL = "https://www.turners.co.nz/General-Goods/Search/electronics/misc/1/"
+
+    def _run(self, model_identified_confidently):
+        self.mock_auction_source.search.return_value = [
+            _auction_result(self.TURNERS_URL, title="Widget", price=50.0, price_type="current_bid"),
+        ]
+        evidence = [
+            ComparableEvidence("Widget", "", "used", 300.0, "NZD", "TradeMe", "u1",
+                                "2026-08-16T00:00:00+00:00", 0.9, True),
+            ComparableEvidence("Widget", "", "used", 310.0, "NZD", "TradeMe", "u2",
+                                "2026-08-16T00:00:00+00:00", 0.85, True),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=evidence):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        mock_verify.return_value = mock.Mock(
+                            status="verified", price=50.0, is_live=True, reason=""
+                        )
+                        mock_identify.return_value = ProductIdentification(
+                            model_identified_confidently=model_identified_confidently
+                        )
+                        opportunities = run_discovery(self._config())
+        self.assertEqual(len(opportunities), 1)
+        return opportunities[0]
+
+    def test_confident_identification_yields_higher_valuation_confidence(self):
+        confident_opp = self._run(model_identified_confidently=True)
+        unconfident_opp = self._run(model_identified_confidently=False)
+        self.assertGreater(
+            confident_opp.valuation.confidence_pct,
+            unconfident_opp.valuation.confidence_pct,
+        )
+
+
+class TestLowSimilaritySoldEvidenceLiquidityVsValuation(_RunDiscoveryTestBase):
+    """Phase 4B.5: MIN_COMPARABLE_SIMILARITY must only gate valuation price
+    calculations. estimate_liquidity() must keep receiving the full,
+    unfiltered evidence list -- a low-similarity SOLD comparable should
+    still count toward liquidity even though it can't set quick_sale_low."""
+
+    TURNERS_URL = "https://www.turners.co.nz/General-Goods/Search/electronics/misc/2/"
+
+    def test_low_similarity_sold_evidence_excluded_from_valuation_but_counted_in_liquidity(self):
+        self.mock_auction_source.search.return_value = [
+            _auction_result(self.TURNERS_URL, title="Gadget", price=50.0, price_type="current_bid"),
+        ]
+        evidence = [
+            # Low similarity (0.10, well under MIN_COMPARABLE_SIMILARITY=0.30)
+            # but a confirmed sale -- must count for liquidity, must not be
+            # able to set quick_sale_low.
+            ComparableEvidence("Gadget", "", "used", 50.0, "NZD", "eBay", "u1",
+                                "2026-08-16T00:00:00+00:00", 0.10, True, evidence_type="SOLD"),
+            # High similarity, not sold -- the only evidence allowed to set
+            # the valuation numbers here.
+            ComparableEvidence("Gadget", "", "used", 500.0, "NZD", "Trade Me", "u2",
+                                "2026-08-16T00:00:00+00:00", 0.80, False, evidence_type="CURRENT_LISTING"),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=evidence):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        mock_verify.return_value = mock.Mock(
+                            status="verified", price=50.0, is_live=True, reason=""
+                        )
+                        mock_identify.return_value = ProductIdentification(model_identified_confidently=True)
+                        opportunities = run_discovery(self._config())
+
+        self.assertEqual(len(opportunities), 1)
+        opp = opportunities[0]
+
+        # Valuation floor comes only from the $500 high-similarity comp,
+        # not the $50 low-similarity one.
+        self.assertEqual(opp.valuation.quick_sale_low, round(500.0 * 0.9, 2))
+        # But liquidity still sees the sold comp -- one is_sold=True item
+        # is enough for MEDIUM per scanner/liquidity.py, unaffected by the
+        # similarity filter.
+        self.assertEqual(opp.liquidity, "MEDIUM")
+        # Full evidence (both items) still present for inspection.
+        self.assertEqual(len(opp.valuation.evidence), 2)
 
 
 if __name__ == "__main__":

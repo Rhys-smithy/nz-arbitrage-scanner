@@ -560,6 +560,10 @@ def run_discovery(config: dict) -> list[Opportunity]:
             costs_excl_purchase=0,  # refined by apply_valuation below once costs are known
             bankroll=bankroll_cfg.get("starting_bankroll", 500),
             api_key=api_key,
+            # Phase 4B.5 bug fix: this must be the real product-identification
+            # confidence, not derived from the trader's own accept/reject
+            # verdict (see scanner/trader.py's trader_review docstring).
+            model_identified_confidently=identification.model_identified_confidently,
         )
 
         opportunity = Opportunity(
