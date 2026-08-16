@@ -117,6 +117,118 @@ def _process_query_results(
     return entry, unique_results
 
 
+_CANDIDATE_GROUP_ORDER = ["turners_general_goods", "turners_vehicles", "other"]
+
+
+def _candidate_group(result) -> str:
+    """Classifies a candidate for FAIR SLOT ALLOCATION only, not for
+    verification -- listing_verification.py has its own, stricter URL
+    matching for that. Turners General Goods and the four vehicle divisions
+    are the only two individual-listing URL shapes turners.co.nz has (see
+    scanner/scrapers/turners_catalog.py and turners_vehicles.py), so "on
+    turners.co.nz, not under /General-Goods/" is a reliable proxy for
+    "vehicle division listing" among is_individual_listing_url() survivors,
+    without duplicating turners_vehicles.DIVISIONS' path table here.
+    """
+    if "turners.co.nz" not in result.url:
+        return "other"
+    if "/General-Goods/" in result.url:
+        return "turners_general_goods"
+    return "turners_vehicles"
+
+
+def _acquisition_evidence_tier(result) -> int:
+    """Lower = stronger evidence that `result.price` reflects something
+    close to a realistic acquisition price, using only already-observed
+    auction state from scanner/scrapers/turners_catalog.py /
+    turners_vehicles.py (scanner/search/auction_search.py carries it
+    through onto SearchResult) -- never an invented or estimated number.
+
+    0: a real, fixed, immediately-payable price (buy_now).
+    1: active bidding AND the seller's reserve is confirmed met -- current
+       price is close to a real transaction price.
+    2: active bidding, reserve state unknown/not yet met/no reserve field
+       at all (every Turners Vehicle candidate is here -- that division's
+       pages never expose reserve_status) -- still more informative than
+       an untouched listing.
+    3: no bids placed yet (`starting_bid`), or auction state is unknown
+       entirely (non-Turners sources, where price_type is always None) --
+       the weakest usable evidence, but not excluded outright.
+    4: no price at all.
+    """
+    if result.price is None:
+        return 4
+    if result.buy_now_price is not None:
+        return 0
+    if result.price_type == "current_bid" and result.reserve_status == "Reserve Met":
+        return 1
+    if result.price_type == "current_bid":
+        return 2
+    return 3
+
+
+def _select_research_candidates(candidates: list, max_research: int, prefer_below: float) -> list:
+    """Replaces a single global cheapest-first sort+slice (pre Run #35 live
+    validation, that logic just did `candidates.sort(key=lambda r: (r.price
+    is None, r.price > prefer_below, r.price)); candidates[:max_research]`).
+
+    That let a large pool of $1 starting-bid General Goods listings consume
+    the entire max_research_items budget and permanently locked out
+    Vehicles -- confirmed in Run #35 (131 raw General Goods vs 80 raw
+    Vehicle candidates; General Goods, scraped first per config.json's
+    turners_categories order, won every $1 tie via Python's stable sort,
+    and all 5 research slots went to General Goods).
+
+    Two independent fixes:
+
+    1. Within each source group, order by (acquisition evidence tier,
+       over-budget, price) -- see _acquisition_evidence_tier(). The
+       existing `prefer_purchase_price_below` concept is retained exactly
+       as before, just demoted beneath the new evidence tier so a
+       real-bid/buy-now candidate no longer loses to a cheaper but
+       unevidenced $1 starting bid.
+    2. Across groups (Turners General Goods / Turners Vehicles / everything
+       else -- Tavily-sourced TradeMe/Thorntons/Mainland/other Turners
+       hits), allocate max_research_items by round robin: one slot per
+       non-exhausted group per round. Mirrors the existing round-robin
+       pattern already in this codebase (query_generator.py's
+       _round_robin_fill(), used for Tavily query allocation), applied
+       here to candidate selection instead.
+
+    Deterministic and side-effect-free: same input always produces the
+    same output, no randomness, no estimated/invented prices.
+    """
+    def sort_key(r):
+        return (
+            _acquisition_evidence_tier(r),
+            r.price is not None and r.price > prefer_below,
+            r.price if r.price is not None else float("inf"),
+        )
+
+    groups: dict = {name: [] for name in _CANDIDATE_GROUP_ORDER}
+    for r in candidates:
+        groups[_candidate_group(r)].append(r)
+    for name in groups:
+        groups[name].sort(key=sort_key)
+
+    selected: list = []
+    next_index = {name: 0 for name in _CANDIDATE_GROUP_ORDER}
+    while len(selected) < max_research:
+        made_progress = False
+        for name in _CANDIDATE_GROUP_ORDER:
+            if len(selected) >= max_research:
+                break
+            i = next_index[name]
+            pool = groups[name]
+            if i < len(pool):
+                selected.append(pool[i])
+                next_index[name] = i + 1
+                made_progress = True
+        if not made_progress:
+            break  # every group exhausted before the budget was fully used
+    return selected
+
+
 def run_discovery(config: dict) -> list[Opportunity]:
     discovery_cfg = config.get("discovery", {})
     if not discovery_cfg.get("enabled", False):
@@ -265,16 +377,10 @@ def run_discovery(config: dict) -> list[Opportunity]:
     # "!= unknown" check let almost everything through).
     candidates = [r for r in deduped if is_individual_listing_url(r.url)]
 
-    # Cheapest-first, capped to bankroll preference, then to max_research_items --
-    # spec section 15: prioritise the $500 bankroll, avoid flooding with expensive items.
-    candidates.sort(
-        key=lambda r: (
-            r.price is None,                          # priced items first
-            r.price is not None and r.price > prefer_below,  # then within-budget items first
-            r.price or float("inf"),                  # then cheapest first
-        )
-    )
-    candidates = candidates[:max_research]
+    # See _select_research_candidates() docstring above for the full
+    # rationale (Run #35 live validation finding: cheapest-first alone let
+    # $1 General Goods starting bids consume the whole research budget).
+    candidates = _select_research_candidates(candidates, max_research, prefer_below)
 
     # Phase 4B.1: a candidate's price (and everything downstream of it --
     # product ID, comparable research, valuation, Flip Score) must never be
@@ -341,6 +447,14 @@ def run_discovery(config: dict) -> list[Opportunity]:
             url=candidate.url,
             source=identify_marketplace(candidate.url),
             current_price=candidate.price,
+            # Carried through from the pre-verification candidate -- a
+            # known, small limitation: if bidding activity happened in the
+            # brief window between initial scrape and verify_listing()'s
+            # re-fetch, this could be stale relative to the now-current
+            # verified price. Not worth widening listing_verification.py's
+            # scope to close (see scanner/listing_verification.py's own
+            # docstring on what it does and doesn't verify).
+            price_type=candidate.price_type,
             identification=identification,
             valuation=valuation,
         )
@@ -366,7 +480,18 @@ def print_top_opportunities(opportunities: list[Opportunity], limit: int = 10) -
     for i, o in enumerate(opportunities[:limit], 1):
         val = o.valuation
         print(f"{i}. {o.title}")
-        print(f"Current: ${o.current_price:.0f}" if o.current_price is not None else "Current: unknown")
+        if o.current_price is not None:
+            current_line = f"Current: ${o.current_price:.0f}"
+            if o.price_type == "starting_bid":
+                # Preserve the observed bid (still printed, unchanged) but
+                # make it unmistakable that it is not a confirmed
+                # acquisition price -- see valuation.py's
+                # compute_profit_and_roi() for why expected profit/ROI
+                # are absent below for exactly this case.
+                current_line += " (starting bid, no bids yet -- not a confirmed price)"
+            print(current_line)
+        else:
+            print("Current: unknown")
         if val.quick_sale_low is not None:
             print(f"Quick resale: ${val.quick_sale_low:.0f}-{val.quick_sale_high:.0f}")
         if o.expected_net_profit_low is not None:
@@ -374,6 +499,10 @@ def print_top_opportunities(opportunities: list[Opportunity], limit: int = 10) -
                   + (f"-{o.expected_net_profit_high:.0f}" if o.expected_net_profit_high else ""))
         if o.roi_low_pct is not None:
             print(f"ROI: {o.roi_low_pct:.0f}%" + (f"-{o.roi_high_pct:.0f}%" if o.roi_high_pct else ""))
+        if o.price_type == "starting_bid" and o.expected_net_profit_low is None:
+            print("Profit/ROI: not computed -- auction hasn't been bid on yet, so the "
+                  "current price isn't a reliable cost basis. See Max buy for the "
+                  "actionable ceiling.")
         if o.max_buy_price is not None:
             print(f"Max buy: ${o.max_buy_price:.0f}")
         print(f"Score: {o.flip_score}")

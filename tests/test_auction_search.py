@@ -189,6 +189,129 @@ class TestVehiclesMapping(unittest.TestCase):
             mock_general.assert_not_called()
 
 
+class TestAuctionMetadataFieldsPreserved(unittest.TestCase):
+    """Phase 4B follow-up (Run #35 live validation): SearchResult now
+    carries price_type/buy_now_price/reserve_status/closing_date/starts_on
+    through from the scraper item dicts, for both Turners source types --
+    these were previously scraped and then silently discarded at this
+    adapter boundary."""
+
+    def test_general_goods_metadata_fields_preserved(self):
+        item = _general_goods_item(
+            price=120.0,
+            price_type="current_bid",
+            buy_now_price=None,
+            reserve_status="Reserve Met",
+            closing_date="12 Aug 26",
+            starts_on="",
+        )
+        with mock.patch(
+            "scanner.search.auction_search.turners_catalog.fetch_all_categories",
+            return_value=[item],
+        ):
+            source = AuctionSearchSource(_config(turners_categories=["Electronics & Tech"]))
+            results = source.search()
+
+        r = results[0]
+        self.assertEqual(r.price_type, "current_bid")
+        self.assertIsNone(r.buy_now_price)
+        self.assertEqual(r.reserve_status, "Reserve Met")
+        self.assertEqual(r.closing_date, "12 Aug 26")
+        self.assertEqual(r.starts_on, "")
+
+    def test_general_goods_starting_bid_no_reserve_metadata_preserved(self):
+        item = _general_goods_item(
+            price=1.0,
+            price_type="starting_bid",
+            buy_now_price=None,
+            reserve_status="No Reserve",
+            closing_date="20 Aug 26",
+        )
+        with mock.patch(
+            "scanner.search.auction_search.turners_catalog.fetch_all_categories",
+            return_value=[item],
+        ):
+            source = AuctionSearchSource(_config(turners_categories=["Electronics & Tech"]))
+            results = source.search()
+
+        r = results[0]
+        self.assertEqual(r.price, 1.0)
+        self.assertEqual(r.price_type, "starting_bid")
+        self.assertEqual(r.reserve_status, "No Reserve")
+
+    def test_general_goods_price_type_resolves_to_buy_now_when_only_buy_now_present(self):
+        # item.get("price_type") is None here (the scraper only sets it when
+        # the Current/Starting Bid regex matches) -- but price still falls
+        # back to buy_now_price, so price_type must resolve to "buy_now",
+        # not stay None (None would misrepresent a real fixed price as
+        # "unknown auction state").
+        item = _general_goods_item(price=None, price_type=None, buy_now_price=249.0)
+        with mock.patch(
+            "scanner.search.auction_search.turners_catalog.fetch_all_categories",
+            return_value=[item],
+        ):
+            source = AuctionSearchSource(_config(turners_categories=["Electronics & Tech"]))
+            results = source.search()
+
+        r = results[0]
+        self.assertEqual(r.price, 249.0)
+        self.assertEqual(r.price_type, "buy_now")
+        self.assertEqual(r.buy_now_price, 249.0)
+
+    def test_vehicle_metadata_fields_preserved(self):
+        item = _vehicle_item(
+            price=15500.0,
+            price_type="current_bid",
+            buy_now_price=17400.0,
+        )
+        with mock.patch(
+            "scanner.search.auction_search.turners_vehicles.fetch_all_divisions",
+            return_value=[item],
+        ):
+            source = AuctionSearchSource(_config(turners_categories=["Cars"]))
+            results = source.search()
+
+        r = results[0]
+        self.assertEqual(r.price_type, "current_bid")
+        self.assertEqual(r.buy_now_price, 17400.0)
+        # turners_vehicles.py never scrapes these for any division -- must
+        # come through as falsy (None), not crash and not fabricate a value.
+        self.assertFalse(r.reserve_status)
+        self.assertEqual(r.closing_date, "")
+        self.assertEqual(r.starts_on, "")
+
+    def test_vehicle_buy_now_only_resolves_price_type_to_buy_now(self):
+        item = _vehicle_item()  # default fixture: price=None, buy_now_price=17400.0
+        with mock.patch(
+            "scanner.search.auction_search.turners_vehicles.fetch_all_divisions",
+            return_value=[item],
+        ):
+            source = AuctionSearchSource(_config(turners_categories=["Cars"]))
+            results = source.search()
+
+        r = results[0]
+        self.assertEqual(r.price, 17400.0)
+        self.assertEqual(r.price_type, "buy_now")
+
+    def test_thorntons_and_mainland_blurb_results_default_new_fields_safely(self):
+        # Regression guard: sources that never touch the new fields at all
+        # (existing behaviour, not part of this change) must still produce
+        # a valid SearchResult with the documented defaults, not crash.
+        with mock.patch(
+            "scanner.search.auction_search.thorntons.fetch_listings",
+            return_value=[{"title": "Lot 12", "url": "https://thorntons.net.nz/auctions/detail/12", "description": ""}],
+        ):
+            source = AuctionSearchSource(_config(turners_categories=[], sites={"thorntons": True}))
+            results = source.search()
+
+        r = results[0]
+        self.assertIsNone(r.price_type)
+        self.assertIsNone(r.buy_now_price)
+        self.assertIsNone(r.reserve_status)
+        self.assertEqual(r.closing_date, "")
+        self.assertEqual(r.starts_on, "")
+
+
 class TestMixedCategories(unittest.TestCase):
     def test_general_goods_and_vehicle_categories_in_the_same_run(self):
         with mock.patch(

@@ -5,13 +5,44 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import unittest
 from unittest import mock
 
-from scanner.discover import DEFAULT_DISCOVERY_DOMAINS, _process_query_results, run_discovery
+from scanner.discover import (
+    DEFAULT_DISCOVERY_DOMAINS,
+    _acquisition_evidence_tier,
+    _candidate_group,
+    _process_query_results,
+    _select_research_candidates,
+    run_discovery,
+)
 from scanner.search.base import SearchResult
 from scanner.models import ProductIdentification, ResaleValuation
 
 
 def _result(url, title="Item", price=None):
     return SearchResult(title=title, url=url, price=price, currency="NZD", source="web_search:tavily")
+
+
+def _auction_result(
+    url,
+    title="Item",
+    price=None,
+    price_type=None,
+    buy_now_price=None,
+    reserve_status=None,
+):
+    """Same idea as _result() but for Turners candidates carrying the
+    Phase 4B follow-up auction-state fields (price_type/buy_now_price/
+    reserve_status) that _select_research_candidates() and
+    valuation.compute_profit_and_roi() now read."""
+    return SearchResult(
+        title=title,
+        url=url,
+        price=price,
+        currency="NZD",
+        source="Turners",
+        price_type=price_type,
+        buy_now_price=buy_now_price,
+        reserve_status=reserve_status,
+    )
 
 
 class TestDefaultDiscoveryDomains(unittest.TestCase):
@@ -97,6 +128,168 @@ class TestProcessQueryResults(unittest.TestCase):
         self.assertEqual(entry2["unique_results"], 1)
         self.assertEqual(entry2["valid_individual_listings"], 1)
         self.assertEqual(len(unique_results2), 1)
+
+
+class TestAcquisitionEvidenceTier(unittest.TestCase):
+    """Phase 4B follow-up (Run #35 live validation): lower tier = stronger
+    evidence that `price` reflects something close to a realistic
+    acquisition price. Every case here is driven only by already-scraped
+    fields -- no estimated/invented data anywhere in this function."""
+
+    def test_no_price_is_worst_tier(self):
+        r = _auction_result("https://www.turners.co.nz/x/1", price=None)
+        self.assertEqual(_acquisition_evidence_tier(r), 4)
+
+    def test_buy_now_is_best_tier_regardless_of_other_fields(self):
+        r = _auction_result(
+            "https://www.turners.co.nz/x/1", price=17400.0, buy_now_price=17400.0, price_type=None
+        )
+        self.assertEqual(_acquisition_evidence_tier(r), 0)
+
+    def test_current_bid_with_reserve_met_is_tier_one(self):
+        r = _auction_result(
+            "https://www.turners.co.nz/x/1", price=120.0, price_type="current_bid",
+            reserve_status="Reserve Met",
+        )
+        self.assertEqual(_acquisition_evidence_tier(r), 1)
+
+    def test_current_bid_without_confirmed_reserve_is_tier_two(self):
+        # Covers both "reserve_status is None" (e.g. every Turners Vehicle
+        # candidate -- that division never scrapes reserve_status) and
+        # "Reserve Not Met" -- neither confirms the reserve is cleared, but
+        # real bidding has still happened, which is still more informative
+        # than an untouched $1 listing.
+        r1 = _auction_result("https://www.turners.co.nz/x/1", price=5500.0, price_type="current_bid")
+        r2 = _auction_result(
+            "https://www.turners.co.nz/x/2", price=50.0, price_type="current_bid",
+            reserve_status="Reserve Not Met",
+        )
+        self.assertEqual(_acquisition_evidence_tier(r1), 2)
+        self.assertEqual(_acquisition_evidence_tier(r2), 2)
+
+    def test_starting_bid_is_tier_three(self):
+        r = _auction_result(
+            "https://www.turners.co.nz/x/1", price=1.0, price_type="starting_bid",
+            reserve_status="No Reserve",
+        )
+        self.assertEqual(_acquisition_evidence_tier(r), 3)
+
+    def test_unknown_auction_state_is_also_tier_three_not_excluded(self):
+        # A priced Tavily result (price_type always None for non-Turners
+        # sources) must not be excluded outright -- it just ranks alongside
+        # starting-bid candidates rather than being treated as evidenced.
+        r = _result("https://www.trademe.co.nz/a/marketplace/listing/1", price=250.0)
+        self.assertEqual(_acquisition_evidence_tier(r), 3)
+
+
+class TestCandidateGroup(unittest.TestCase):
+    """Phase 4B follow-up: classifies a candidate for FAIR SLOT ALLOCATION
+    only (see _select_research_candidates), not for verification."""
+
+    def test_general_goods_url_groups_as_general_goods(self):
+        r = _auction_result(
+            "https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/28374370/"
+        )
+        self.assertEqual(_candidate_group(r), "turners_general_goods")
+
+    def test_vehicle_division_url_groups_as_vehicles(self):
+        for url in [
+            "https://www.turners.co.nz/Cars/Used-Cars-for-Sale/123456/",
+            "https://www.turners.co.nz/Trucks-Machinery/Used-Trucks-and-Machinery-for-Sale/654321/",
+            "https://www.turners.co.nz/motorcycles-scooters/Used-Motorbikes-for-Sale/111222/",
+            "https://www.turners.co.nz/buses-caravans/Used-Caravans-and-Motorhomes-for-Sale/333444/",
+        ]:
+            with self.subTest(url=url):
+                self.assertEqual(_candidate_group(_auction_result(url)), "turners_vehicles")
+
+    def test_non_turners_url_groups_as_other(self):
+        r = _result("https://www.trademe.co.nz/a/marketplace/listing/999")
+        self.assertEqual(_candidate_group(r), "other")
+
+
+class TestSelectResearchCandidates(unittest.TestCase):
+    """Phase 4B follow-up: the round-robin/evidence-tier replacement for the
+    old global cheapest-first sort+slice. See _select_research_candidates()
+    docstring in scanner/discover.py for the full rationale."""
+
+    def _gg(self, n, price=1.0, price_type="starting_bid", reserve_status=None):
+        return [
+            _auction_result(
+                f"https://www.turners.co.nz/General-Goods/Search/electronics/cameras/{i}/",
+                title=f"GG item {i}", price=price, price_type=price_type, reserve_status=reserve_status,
+            )
+            for i in range(n)
+        ]
+
+    def _vehicles(self, n, price=1.0, price_type="current_bid"):
+        return [
+            _auction_result(
+                f"https://www.turners.co.nz/Cars/Used-Cars-for-Sale/{200000 + i}/",
+                title=f"Vehicle {i}", price=price, price_type=price_type,
+            )
+            for i in range(n)
+        ]
+
+    def test_general_goods_cannot_completely_starve_vehicles(self):
+        # This is exactly Run #35's observed failure mode: a large pool of
+        # $1 starting-bid General Goods candidates (131 raw that run) vs a
+        # much smaller Vehicles pool (80 raw that run) -- General Goods
+        # must no longer be able to take every one of max_research_items'
+        # slots purely by outnumbering Vehicles and sorting first.
+        candidates = self._gg(40) + self._vehicles(3)  # GG appended first, same as config order
+        selected = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+
+        groups = {_candidate_group(r) for r in selected}
+        self.assertIn("turners_vehicles", groups)
+        vehicle_count = sum(1 for r in selected if _candidate_group(r) == "turners_vehicles")
+        self.assertGreaterEqual(vehicle_count, 1)
+
+    def test_evidence_tier_beats_cheaper_but_unevidenced_candidate_within_a_group(self):
+        cheap_starting_bid = _auction_result(
+            "https://www.turners.co.nz/General-Goods/Search/electronics/x/1/",
+            title="Cheap unevidenced", price=1.0, price_type="starting_bid",
+        )
+        pricier_real_bid = _auction_result(
+            "https://www.turners.co.nz/General-Goods/Search/electronics/x/2/",
+            title="Real bidding", price=120.0, price_type="current_bid", reserve_status="Reserve Met",
+        )
+        selected = _select_research_candidates(
+            [cheap_starting_bid, pricier_real_bid], max_research=1, prefer_below=250
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].title, "Real bidding")
+
+    def test_prefer_purchase_price_below_still_breaks_ties_within_a_tier(self):
+        over_budget = _auction_result(
+            "https://www.turners.co.nz/General-Goods/Search/electronics/x/1/",
+            title="Over budget", price=400.0, price_type="current_bid", reserve_status="Reserve Met",
+        )
+        within_budget = _auction_result(
+            "https://www.turners.co.nz/General-Goods/Search/electronics/x/2/",
+            title="Within budget", price=200.0, price_type="current_bid", reserve_status="Reserve Met",
+        )
+        selected = _select_research_candidates(
+            [over_budget, within_budget], max_research=1, prefer_below=250
+        )
+
+        self.assertEqual(selected[0].title, "Within budget")
+
+    def test_does_not_exceed_max_research_items(self):
+        candidates = self._gg(10) + self._vehicles(10)
+        selected = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+        self.assertEqual(len(selected), 5)
+
+    def test_deterministic_across_repeated_calls(self):
+        candidates = self._gg(12) + self._vehicles(5)
+        first = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+        second = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+        self.assertEqual([r.url for r in first], [r.url for r in second])
+
+    def test_fewer_candidates_than_budget_returns_all_of_them(self):
+        candidates = self._gg(2) + self._vehicles(1)
+        selected = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+        self.assertEqual(len(selected), 3)
 
 
 class _RunDiscoveryTestBase(unittest.TestCase):
@@ -354,6 +547,134 @@ class TestRunDiscoveryAuctionSourceCandidates(_RunDiscoveryTestBase):
 
         self.assertEqual(opportunities, [])
         mock_identify.assert_not_called()
+
+
+class TestRunDiscoveryVehiclesNotStarvedByGeneralGoods(_RunDiscoveryTestBase):
+    """End-to-end regression test for Run #35's observed failure mode: a
+    large pool of $1 starting-bid General Goods candidates must not be able
+    to consume every max_research_items slot and lock Vehicles out
+    entirely, purely because General Goods is scraped first and both sides
+    tie on price."""
+
+    def setUp(self):
+        super().setUp()
+        gg_candidates = [
+            _auction_result(
+                f"https://www.turners.co.nz/General-Goods/Search/electronics/cameras/{i}/",
+                title=f"GG item {i}", price=1.0, price_type="starting_bid",
+            )
+            for i in range(40)  # far more than max_research_items=5
+        ]
+        vehicle_candidates = [
+            _auction_result(
+                f"https://www.turners.co.nz/Cars/Used-Cars-for-Sale/{200000 + i}/",
+                title=f"Vehicle {i}", price=1.0, price_type="current_bid",
+            )
+            for i in range(3)
+        ]
+        # General Goods listed first, exactly mirroring config.json's
+        # turners_categories order (General Goods categories before Cars/
+        # Trucks & Machinery/Motorbikes/Trailers & Caravans) and
+        # AuctionSearchSource.search()'s iteration order.
+        self.mock_auction_source.search.return_value = gg_candidates + vehicle_candidates
+
+    def test_at_least_one_vehicle_candidate_reaches_identify_product(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.side_effect = lambda url, cache: mock.Mock(
+                                status="verified", price=1.0, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            run_discovery(self._config())
+
+        identified_titles = {call.args[0] for call in mock_identify.call_args_list}
+        vehicle_titles = {t for t in identified_titles if t.startswith("Vehicle")}
+        self.assertGreaterEqual(
+            len(vehicle_titles), 1,
+            f"expected at least one Vehicle candidate among identified titles, got: {identified_titles}",
+        )
+
+
+class TestRunDiscoveryStartingBidValuationSemantics(_RunDiscoveryTestBase):
+    """Phase 4B follow-up regression tests: a `starting_bid` price must not
+    be represented as though it were a confirmed acquisition price for
+    profit/ROI purposes, while the observed bid itself, cost modelling, and
+    max_buy_price (all price-agnostic or explicitly-labelled-as-observed)
+    remain exactly as before."""
+
+    TURNERS_URL = "https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/28374370/"
+
+    def _run(self, price_type, verify_price=1.0):
+        self.mock_auction_source.search.return_value = [
+            _auction_result(self.TURNERS_URL, title="Canon Powershot", price=1.0, price_type=price_type),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.return_value = mock.Mock(
+                                status="verified", price=verify_price, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            # A real ResaleValuation with quick_sale set, so
+                            # the real (unmocked) apply_valuation() /
+                            # compute_profit_and_roi() actually run --
+                            # unlike most other tests in this file, this one
+                            # needs to exercise that real arithmetic.
+                            mock_trader.return_value = (
+                                ResaleValuation(quick_sale_low=400.0, quick_sale_high=550.0, confidence_pct=4.0),
+                                {"ran": True},
+                            )
+                            opportunities = run_discovery(self._config())
+        self.assertEqual(len(opportunities), 1)
+        return opportunities[0]
+
+    def test_starting_bid_does_not_produce_expected_profit_or_roi(self):
+        opp = self._run(price_type="starting_bid")
+
+        self.assertEqual(opp.price_type, "starting_bid")
+        # The observed bid is preserved as observed data -- not hidden, not
+        # replaced with an estimate.
+        self.assertEqual(opp.current_price, 1.0)
+        # But it must not be represented as a confirmed acquisition price
+        # for profit/ROI purposes.
+        self.assertIsNone(opp.expected_net_profit_low)
+        self.assertIsNone(opp.expected_net_profit_high)
+        self.assertIsNone(opp.roi_low_pct)
+        self.assertIsNone(opp.roi_high_pct)
+
+    def test_starting_bid_max_buy_price_is_still_computed(self):
+        # max_buy_price is price-agnostic (depends on quick_sale_value and
+        # cost_model, not on current_price/price_type) -- it is the
+        # legitimate, actionable ceiling regardless of auction stage, and
+        # must not be suppressed by this fix.
+        opp = self._run(price_type="starting_bid")
+        self.assertIsNotNone(opp.max_buy_price)
+        self.assertGreater(opp.max_buy_price, 0)
+
+    def test_current_bid_with_same_price_still_produces_profit_and_roi(self):
+        # Proves the fix is scoped to price_type == "starting_bid" only --
+        # a real current_bid at the same $1 price is unaffected.
+        opp = self._run(price_type="current_bid")
+
+        self.assertEqual(opp.price_type, "current_bid")
+        self.assertIsNotNone(opp.expected_net_profit_low)
+        self.assertIsNotNone(opp.roi_low_pct)
+
+    def test_unknown_price_type_non_turners_behaviour_unchanged(self):
+        # price_type is None for every existing (pre-Phase-4B) source --
+        # Tavily/SerpAPI/Brave never set it. Profit/ROI computation for
+        # those candidates must be completely unaffected by this change.
+        opp = self._run(price_type=None)
+
+        self.assertIsNone(opp.price_type)
+        self.assertIsNotNone(opp.expected_net_profit_low)
+        self.assertIsNotNone(opp.roi_low_pct)
 
 
 class TestRunDiscoveryAuctionWinsCanonicalDuplicate(_RunDiscoveryTestBase):

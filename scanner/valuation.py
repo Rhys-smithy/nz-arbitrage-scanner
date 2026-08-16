@@ -33,10 +33,28 @@ def compute_profit_and_roi(opportunity: Opportunity) -> None:
 
     Uses the QUICK SALE value only, per spec section 10: "The financial
     recommendation must primarily use the Quick Sale value."
+
+    Phase 4B follow-up (Run #35 live validation finding): "expected profit"
+    and "ROI" are forecast language -- they imply current_price is a real
+    cost basis. When price_type == "starting_bid", current_price is the
+    auction's opening number with zero bids placed; it has no evidentiary
+    relationship to what the item will actually sell for; computing a
+    profit/ROI "forecast" off it would be exactly the misleading
+    acquisition-price representation the audit flagged (a $1 opening bid
+    on a real item mechanically produces a 1000%+ ROI number that means
+    nothing). So: for starting-bid candidates specifically, profit/ROI are
+    left unset (None) rather than computed off an unrealistic basis --
+    NOT replaced with an invented/estimated "more realistic" price.
+    current_price itself is untouched here and still flows everywhere else
+    (display, cost modelling, bidding_room) as the real observed bid.
+    Every other price_type (current_bid, buy_now, or non-Turners sources
+    where price_type is None) is completely unaffected by this check.
     """
     val = opportunity.valuation
     costs = opportunity.costs
     if opportunity.current_price is None:
+        return
+    if opportunity.price_type == "starting_bid":
         return
 
     total_cost = costs.total  # purchase price + all fees/costs

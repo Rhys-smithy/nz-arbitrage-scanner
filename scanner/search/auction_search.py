@@ -12,6 +12,19 @@ from scanner.search.base import SearchResult, SearchSource
 from scanner.scrapers import turners_catalog, turners_vehicles, thorntons, mainland_auctions
 
 
+def _resolve_price_type(item: dict) -> str | None:
+    """`price` on the adapted SearchResult falls back to buy_now_price when
+    the scraper found no bid price at all (see the `price = item.get(...)
+    or item.get(...)` fallback below) -- in that case the scraper's own
+    `price_type` is None even though we now know the number IS a buy-now
+    price, not an unset field. Correct that one case; otherwise pass the
+    scraper's price_type straight through unchanged."""
+    price_type = item.get("price_type")
+    if price_type is None and item.get("price") is None and item.get("buy_now_price") is not None:
+        return "buy_now"
+    return price_type
+
+
 def _turners_item_to_result(item: dict) -> SearchResult:
     price = item.get("price") or item.get("buy_now_price")
     return SearchResult(
@@ -24,13 +37,22 @@ def _turners_item_to_result(item: dict) -> SearchResult:
         description=item.get("subcategory", ""),
         condition=item.get("condition", "unknown"),
         is_sold=False,  # live/asking auction price, not a completed sale
+        price_type=_resolve_price_type(item),
+        buy_now_price=item.get("buy_now_price"),
+        reserve_status=item.get("reserve_status"),
+        closing_date=item.get("closing_date", ""),
+        starts_on=item.get("starts_on", ""),
     )
 
 
 def _turners_vehicle_item_to_result(item: dict) -> SearchResult:
     """Same shape as _turners_item_to_result but for turners_vehicles.py's
     slightly different item dict (odometer instead of a condition field,
-    subcategory is the division name rather than a General Goods category)."""
+    subcategory is the division name rather than a General Goods category).
+    turners_vehicles.py always sets reserve_status/closing_date to "" (that
+    module doesn't scrape them for vehicle divisions) and never sets
+    starts_on at all -- those come through as "" via .get() defaults below,
+    same as any other source that doesn't have them."""
     price = item.get("price") or item.get("buy_now_price")
     description = item.get("subcategory", "")
     odometer = item.get("odometer")
@@ -46,6 +68,11 @@ def _turners_vehicle_item_to_result(item: dict) -> SearchResult:
         description=description,
         condition=item.get("condition", "unknown"),
         is_sold=False,
+        price_type=_resolve_price_type(item),
+        buy_now_price=item.get("buy_now_price"),
+        reserve_status=item.get("reserve_status") or None,
+        closing_date=item.get("closing_date", ""),
+        starts_on=item.get("starts_on", ""),
     )
 
 

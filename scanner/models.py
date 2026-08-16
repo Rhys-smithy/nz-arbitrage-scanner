@@ -105,6 +105,12 @@ class Opportunity:
     url: str
     source: str
     current_price: Optional[float]
+    # Phase 4B follow-up: carried straight through from the discovery
+    # candidate's SearchResult.price_type (see scanner/search/base.py).
+    # "starting_bid" means current_price is the auction's opening number
+    # with zero bids placed -- valuation.py must not treat that as a
+    # confirmed acquisition price. None for non-Turners sources / unknown.
+    price_type: Optional[str] = None
     identification: ProductIdentification = field(default_factory=ProductIdentification)
     valuation: ResaleValuation = field(default_factory=ResaleValuation)
     costs: CostBreakdown = field(default_factory=CostBreakdown)

@@ -41,6 +41,29 @@ class SearchResult:
     condition: str = "unknown"
     is_sold: bool = False  # True only for confirmed completed/sold transactions
 
+    # Phase 4B follow-up (post Turners-direct-discovery live validation):
+    # minimum useful auction-state metadata, sourced only from what
+    # scanner/scrapers/turners_catalog.py and turners_vehicles.py already
+    # parse -- nothing here is invented or estimated. All optional/defaulted
+    # so every existing source (Tavily/SerpAPI/Brave, Thorntons/Mainland
+    # blurbs) and every existing SearchResult(...) call site keeps working
+    # unchanged; they simply never populate these and get the defaults below.
+    #
+    # price_type distinguishes what `price` actually IS: "current_bid" (real
+    # bidding has happened), "starting_bid" (the seller's opening number,
+    # zero bids placed), "buy_now" (a fixed, immediately-payable price), or
+    # None (unknown / non-Turners source, e.g. a Tavily snippet with a
+    # text-extracted price and no structured auction state at all).
+    price_type: Optional[str] = None
+    buy_now_price: Optional[float] = None
+    # "Reserve Met" / "No Reserve" / "Reserve Not Met" / None (General Goods
+    # only -- Turners' vehicle division pages don't expose this, so vehicle
+    # candidates always carry None here; that is itself meaningful signal,
+    # not missing data).
+    reserve_status: Optional[str] = None
+    closing_date: str = ""
+    starts_on: str = ""
+
     def to_dict(self) -> dict:
         return {
             "title": self.title,
@@ -54,6 +77,11 @@ class SearchResult:
             "timestamp": self.timestamp,
             "condition": self.condition,
             "is_sold": self.is_sold,
+            "price_type": self.price_type,
+            "buy_now_price": self.buy_now_price,
+            "reserve_status": self.reserve_status,
+            "closing_date": self.closing_date,
+            "starts_on": self.starts_on,
         }
 
 
