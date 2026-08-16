@@ -53,8 +53,19 @@ class TestDefaultDiscoveryDomains(unittest.TestCase):
     def test_default_domains_are_the_known_nz_marketplaces(self):
         self.assertEqual(
             set(DEFAULT_DISCOVERY_DOMAINS),
-            {"trademe.co.nz", "turners.co.nz", "thorntons.net.nz", "mainlandauctions.nz"},
+            {"trademe.co.nz", "turners.co.nz"},
         )
+
+    def test_thorntons_and_mainland_excluded_from_default_domains(self):
+        # Source audit (2026-08-16): both are confirmed JS-only bidding
+        # platforms with zero real conversion through Tavily-style search
+        # discovery -- see DEFAULT_DISCOVERY_DOMAINS's docstring in
+        # scanner/discover.py. Removing them frees Tavily's per-query
+        # result budget for domains that can actually produce a candidate.
+        # (They remain fully supported by the legacy scan pipeline via
+        # config.json's separate `sites` toggle -- untouched by this.)
+        for domain in ("thorntons.net.nz", "mainlandauctions.nz"):
+            self.assertNotIn(domain, DEFAULT_DISCOVERY_DOMAINS)
 
 
 class TestProcessQueryResults(unittest.TestCase):
@@ -426,13 +437,112 @@ class TestRunDiscoveryVerificationGate(_RunDiscoveryTestBase):
         mock_research.assert_not_called()
 
     def test_unsupported_candidate_never_reaches_identify_product(self):
+        # Phase 4B.3: "unsupported" is no longer dropped -- it's preserved
+        # as exactly one WATCH opportunity -- but must still never reach
+        # the AI/valuation pipeline (identify_product/research_comparables).
         with mock.patch("scanner.discover.verify_listing") as mock_verify:
             with mock.patch("scanner.discover.identify_product") as mock_identify:
-                mock_verify.return_value = mock.Mock(status="unsupported", price=None, reason="robots.txt disallows")
+                with mock.patch("scanner.discover.research_comparables") as mock_research:
+                    mock_verify.return_value = mock.Mock(
+                        status="unsupported", price=None, reason="robots.txt disallows"
+                    )
+                    opportunities = run_discovery(self._config())
+
+        mock_identify.assert_not_called()
+        mock_research.assert_not_called()
+        self.assertEqual(len(opportunities), 1)
+
+    def test_unsupported_candidate_becomes_a_clearly_labelled_watch_opportunity(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product"):
+                mock_verify.return_value = mock.Mock(
+                    status="unsupported", price=None,
+                    reason="Trade Me listing pages are disallowed by robots.txt",
+                )
                 opportunities = run_discovery(self._config())
 
-        self.assertEqual(opportunities, [])
-        mock_identify.assert_not_called()
+        self.assertEqual(len(opportunities), 1)
+        o = opportunities[0]
+        # Never treated as verified, never able to reach the BUY path.
+        self.assertEqual(o.verification_status, "unsupported")
+        self.assertEqual(o.decision, "WATCH")
+        self.assertNotIn(o.decision, ("BUY", "PROFITABLE BUT CAPITAL RISK"))
+        # URL/title preserved from the discovery candidate, not fabricated.
+        self.assertEqual(o.url, self.mock_source.search.return_value[0].url)
+        self.assertEqual(o.title, self.mock_source.search.return_value[0].title)
+        # The unsupported reason from verify_listing() is surfaced verbatim,
+        # plus an explicit manual-confirmation instruction.
+        self.assertTrue(any("robots.txt" in r for r in o.decision_reasons))
+        self.assertTrue(any("UNVERIFIED" in r and "confirm" in r.lower() for r in o.decision_reasons))
+        # No valuation/scoring work was done -- fields stay at their
+        # honest defaults, nothing invented.
+        self.assertIsNone(o.flip_score)
+        self.assertIsNone(o.max_buy_price)
+        self.assertIsNone(o.expected_net_profit_low)
+
+    def test_unsupported_candidate_preserves_snippet_price_marked_unverified(self):
+        # A search-snippet price that DOES exist must be preserved (not
+        # discarded, not treated as confirmed) -- this is the "available
+        # snippet/price evidence" the unsupported/WATCH tier exists to keep.
+        self.mock_source.search.return_value = [
+            _result(self.mock_source.search.return_value[0].url, title="Canon EOS", price=180.0),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product"):
+                mock_verify.return_value = mock.Mock(
+                    status="unsupported", price=None, reason="robots.txt disallows"
+                )
+                opportunities = run_discovery(self._config())
+
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0].current_price, 180.0)
+        self.assertEqual(opportunities[0].verification_status, "unsupported")
+
+    def test_unsupported_candidate_with_no_snippet_price_stays_none_not_fabricated(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product"):
+                mock_verify.return_value = mock.Mock(
+                    status="unsupported", price=None, reason="robots.txt disallows"
+                )
+                opportunities = run_discovery(self._config())
+
+        self.assertEqual(len(opportunities), 1)
+        self.assertIsNone(opportunities[0].current_price)
+
+    def test_unsupported_count_logged_separately_from_dropped(self):
+        import io
+        import contextlib
+
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product"):
+                mock_verify.return_value = mock.Mock(
+                    status="unsupported", price=None, reason="robots.txt disallows"
+                )
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    run_discovery(self._config())
+
+        output = buf.getvalue()
+        self.assertIn("1 unsupported (preserved as WATCH)", output)
+        self.assertIn("0 dropped", output)
+
+    def test_verified_opportunity_defaults_to_verified_status(self):
+        from scanner.models import ProductIdentification, ResaleValuation
+
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.return_value = mock.Mock(
+                                status="verified", price=199.0, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            opportunities = run_discovery(self._config())
+
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0].verification_status, "verified")
 
     def test_verified_candidate_reaches_identify_product_with_authoritative_price(self):
         from scanner.models import ProductIdentification, ResaleValuation

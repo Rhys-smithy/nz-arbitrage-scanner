@@ -123,6 +123,21 @@ class Opportunity:
     reserve_status: Optional[str] = None
     closing_date: str = ""
     starts_on: str = ""
+    # Phase 4B.3: "verified" (default) means listing_verification.verify_listing()
+    # re-fetched this candidate's own authoritative source and confirmed
+    # current_price/condition itself -- the normal case for every Turners
+    # opportunity today. "unsupported" marks a candidate from a source
+    # verify_listing() can never compliantly re-fetch (Trade Me/Thorntons/
+    # Mainland Auctions -- see scanner/listing_verification.py), preserved
+    # here instead of silently discarded so the search-provider signal
+    # isn't lost, but explicitly NOT independently confirmed:
+    # current_price/condition are whatever the search snippet said, and
+    # scanner/discover.py hardcodes decision="WATCH" for these -- this
+    # field is the unambiguous, testable marker that must never read
+    # "verified" for such a candidate. Additive field, keyword-only at
+    # every construction site (same pattern as buy_now_price etc. above),
+    # so no positional risk to any existing caller.
+    verification_status: str = "verified"
     identification: ProductIdentification = field(default_factory=ProductIdentification)
     valuation: ResaleValuation = field(default_factory=ResaleValuation)
     costs: CostBreakdown = field(default_factory=CostBreakdown)

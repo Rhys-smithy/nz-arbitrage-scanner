@@ -241,9 +241,7 @@
     ],
     "include_domains": [
       "trademe.co.nz",
-      "turners.co.nz",
-      "thorntons.net.nz",
-      "mainlandauctions.nz"
+      "turners.co.nz"
     ]
   }
 }

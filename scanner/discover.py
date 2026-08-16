@@ -45,11 +45,23 @@ from scanner.valuation import apply_valuation
 # pipeline stage, but must never surface as a buyable opportunity). These
 # are the domains this repo already treats as real marketplaces with a
 # working individual-listing pattern in search/util.py.
+#
+# Thorntons/Mainland Auctions were removed from this list (source audit,
+# 2026-08-16): both are confirmed JS-only bidding platforms that even
+# Google can't index (see README.md), so Tavily-style search discovery
+# has never found real per-lot candidates there in practice, and
+# scanner/listing_verification.py has always marked anything from either
+# source "unsupported" -- zero conversion, forever. Keeping them in the
+# domain filter only diluted Tavily's per-query result budget away from
+# domains that can actually produce a candidate. Removing them is a
+# config-shaped change only: the sources themselves are untouched, still
+# fully supported by the legacy scan pipeline (config.json's separate
+# `sites` toggle), and still handled correctly by verify_listing() /
+# discover.py's WATCH-preservation path below if a candidate from either
+# ever does turn up some other way.
 DEFAULT_DISCOVERY_DOMAINS = [
     "trademe.co.nz",
     "turners.co.nz",
-    "thorntons.net.nz",
-    "mainlandauctions.nz",
 ]
 
 _EBAY_DOMAINS = {"ebay.com", "www.ebay.com", "ebay.com.au", "www.ebay.com.au"}
@@ -231,6 +243,59 @@ def _select_research_candidates(candidates: list, max_research: int, prefer_belo
     return selected
 
 
+def _build_unverified_watch_opportunity(candidate, verified) -> Opportunity:
+    """Phase 4B.3: preserves a discovery candidate whose source
+    listing_verification.verify_listing() reports as "unsupported" (e.g.
+    Trade Me, Thorntons, Mainland Auctions -- a compliant re-fetch is
+    structurally impossible for these, see that module's docstring) as a
+    clearly labelled WATCH opportunity, instead of the previous behaviour
+    of discarding it identically to a genuinely "unavailable" candidate.
+
+    Deliberately does NOT call identify_product/research_comparables/
+    apply_valuation/score_and_decide -- running the paid AI/valuation
+    pipeline on a price that was never independently confirmed would
+    present false precision on evidence Phase 4B.1 already established
+    isn't trustworthy alone (Tavily search-snippet text), and burns AI
+    budget on a candidate this function can already tell isn't going to
+    reach BUY. Only what discovery itself already observed is carried
+    through -- title/url/source/price/price_type/buy_now_price/
+    reserve_status/closing_date/starts_on, exactly as scraped -- nothing
+    here is invented, and every valuation/scoring field (flip_score,
+    max_buy_price, expected profit/ROI, etc.) is left at its dataclass
+    default (None/"unknown") rather than fabricated.
+
+    decision is hardcoded "WATCH" and verification_status="unsupported"
+    -- this candidate can never reach "BUY" or "PROFITABLE BUT CAPITAL
+    RISK" through this path, by construction, not by downstream filtering.
+    """
+    reasons = [
+        f"Verification unsupported: {verified.reason}",
+        "Price and evidence are UNVERIFIED (from search-result text only, "
+        "not re-fetched from the listing itself) -- open the listing and "
+        "confirm price, condition, and availability manually before any "
+        "purchase decision.",
+    ]
+    if candidate.description:
+        reasons.append(f"Search snippet: {candidate.description}")
+    if candidate.location:
+        reasons.append(f"Location (from search result, unverified): {candidate.location}")
+
+    return Opportunity(
+        title=candidate.title,
+        url=candidate.url,
+        source=identify_marketplace(candidate.url),
+        current_price=candidate.price,
+        price_type=candidate.price_type,
+        buy_now_price=candidate.buy_now_price,
+        reserve_status=candidate.reserve_status,
+        closing_date=candidate.closing_date,
+        starts_on=candidate.starts_on,
+        verification_status="unsupported",
+        decision="WATCH",
+        decision_reasons=reasons,
+    )
+
+
 def run_discovery(config: dict) -> list[Opportunity]:
     discovery_cfg = config.get("discovery", {})
     if not discovery_cfg.get("enabled", False):
@@ -396,21 +461,42 @@ def run_discovery(config: dict) -> list[Opportunity]:
     verification_cache = VerificationCache(user_agent, request_delay)
 
     verified_candidates = []
+    watch_unverified_opportunities: list[Opportunity] = []
     verification_dropped = 0
     for candidate in candidates:
         verified = verify_listing(candidate.url, verification_cache)
-        if verified.status != "verified":
-            verification_dropped += 1
+        if verified.status == "verified":
+            candidate.price = verified.price  # overwrite snippet-derived price with the authoritative one
+            verified_candidates.append(candidate)
+            continue
+        if verified.status == "unsupported":
+            # Phase 4B.3: structurally can't be compliantly re-verified
+            # (Trade Me/Thorntons/Mainland Auctions) -- preserved as a
+            # WATCH opportunity (see _build_unverified_watch_opportunity)
+            # instead of being dropped like a genuinely "unavailable"
+            # candidate below. Never joins `verified_candidates`, so it
+            # can never reach identify_product/valuation/score_and_decide.
+            watch_unverified_opportunities.append(
+                _build_unverified_watch_opportunity(candidate, verified)
+            )
             print(
-                f"[discover]   verification dropped: status={verified.status} "
+                f"[discover]   verification unsupported -> WATCH (unverified): "
                 f"url={candidate.url!r} reason={verified.reason!r}"
             )
             continue
-        candidate.price = verified.price  # overwrite snippet-derived price with the authoritative one
-        verified_candidates.append(candidate)
+        # status == "unavailable" (or anything else non-"verified"): the
+        # source was attempted but no authoritative price/data could be
+        # found (e.g. item not on page 1 of a Turners catalog) -- still
+        # dropped outright, unchanged from pre-4B.3 behaviour.
+        verification_dropped += 1
+        print(
+            f"[discover]   verification dropped: status={verified.status} "
+            f"url={candidate.url!r} reason={verified.reason!r}"
+        )
 
     print(
         f"[discover] verification: {len(verified_candidates)} verified, "
+        f"{len(watch_unverified_opportunities)} unsupported (preserved as WATCH), "
         f"{verification_dropped} dropped (of {len(candidates)} candidates)."
     )
     candidates = verified_candidates
@@ -480,6 +566,15 @@ def run_discovery(config: dict) -> list[Opportunity]:
 
     save_stats(stats)
 
+    # Phase 4B.3: append the preserved-but-unverified WATCH opportunities
+    # after the scored loop above, not into `candidates`/the loop itself --
+    # they were never meant to reach identify_product/valuation, and this
+    # keeps that guarantee structural rather than relying on every field
+    # on them happening to be falsy. flip_score is None for all of these,
+    # so the sort below (None -> 0) places them alongside/after PASS-band
+    # scored opportunities rather than displacing any real BUY/WATCH result.
+    opportunities.extend(watch_unverified_opportunities)
+
     opportunities.sort(key=lambda o: o.flip_score or 0, reverse=True)
 
     # Phase 4B.2 (persistence port): persist every Opportunity from this run
@@ -498,6 +593,11 @@ def run_discovery(config: dict) -> list[Opportunity]:
         "queries_run": len(queries),
         "candidates_found": candidates_found,
         "candidates_verified": len(verified_candidates),
+        # Phase 4B.3: split out from candidates_verification_dropped --
+        # these were preserved as WATCH opportunities (see
+        # watch_unverified_opportunities above), not discarded. Only
+        # genuinely "unavailable" candidates count as dropped now.
+        "candidates_verification_unsupported": len(watch_unverified_opportunities),
         "candidates_verification_dropped": verification_dropped,
         "opportunity_count": len(opportunities),
         "decision_counts": dict(Counter(o.decision for o in opportunities)),
