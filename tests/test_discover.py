@@ -981,5 +981,173 @@ class TestRunDiscoveryTavilyAvailablePathUnchanged(_RunDiscoveryTestBase):
             self.assertEqual(call.kwargs.get("include_domains"), DEFAULT_DISCOVERY_DOMAINS)
 
 
+
+class TestRunDiscoveryUnsupportedSourceBypassesResearchCap(_RunDiscoveryTestBase):
+    """Phase 4B.4: unsupported-source candidates (Trade Me today, anything
+    else verify_listing() can't verify tomorrow) must not compete with
+    Turners for the max_research_items-capped research slots. They cost
+    zero AI/Tavily budget regardless -- verify_listing() never makes an
+    HTTP request for them (see scanner/listing_verification.py) -- so
+    letting one win a round-robin slot never saved any AI spend; it only
+    ever cost a Turners candidate its shot at the real research pipeline.
+    See run_discovery()'s research_eligible/bypass_candidates split."""
+
+    def _verify_side_effect(self, turners_price=50.0):
+        def _verify(url, cache):
+            if "turners.co.nz" in url:
+                return mock.Mock(status="verified", price=turners_price, is_live=True, reason="")
+            return mock.Mock(
+                status="unsupported", price=None,
+                reason="Trade Me listing pages are disallowed by robots.txt",
+            )
+        return _verify
+
+    def _turners_candidates(self, n, price=50.0):
+        return [
+            _auction_result(
+                f"https://www.turners.co.nz/General-Goods/Search/electronics/cameras/{i}/",
+                title=f"Turners item {i}", price=price, price_type="current_bid",
+            )
+            for i in range(n)
+        ]
+
+    def _trademe_candidates(self, n):
+        return [
+            _result(f"https://www.trademe.co.nz/a/marketplace/listing/{1000 + i}", title=f"Trade Me item {i}")
+            for i in range(n)
+        ]
+
+    def _run_with_full_pipeline_mocked(self, turners_n, trademe_n):
+        self.mock_auction_source.search.return_value = self._turners_candidates(turners_n)
+        self.mock_source.search.return_value = self._trademe_candidates(trademe_n)
+        with mock.patch("scanner.discover.verify_listing", side_effect=self._verify_side_effect()):
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch(
+                    "scanner.discover.research_comparables", return_value=[]
+                ) as mock_comparables:
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            opportunities = run_discovery(self._config())
+        return opportunities, mock_identify, mock_comparables
+
+    def test_trademe_candidates_do_not_consume_research_slots(self):
+        # Exactly max_research_items=5 Turners candidates + 3 Trade Me
+        # candidates. If Trade Me competed for slots, at least one Turners
+        # candidate would lose out; instead all 5 Turners candidates must
+        # still be researched, on top of all 3 Trade Me leads preserved.
+        opportunities, mock_identify, _ = self._run_with_full_pipeline_mocked(turners_n=5, trademe_n=3)
+
+        turners_opps = [o for o in opportunities if o.source == "Turners"]
+        trademe_opps = [o for o in opportunities if o.source == "Trade Me"]
+        self.assertEqual(len(turners_opps), 5)
+        self.assertEqual(len(trademe_opps), 3)
+        # identify_product is only ever called for candidates that reached
+        # the real research pipeline -- never for Trade Me.
+        self.assertEqual(mock_identify.call_count, 5)
+
+    def test_multiple_trademe_candidates_are_all_preserved_as_watch(self):
+        opportunities, mock_identify, mock_comparables = self._run_with_full_pipeline_mocked(
+            turners_n=0, trademe_n=4
+        )
+
+        self.assertEqual(len(opportunities), 4)
+        self.assertTrue(all(o.source == "Trade Me" for o in opportunities))
+        self.assertTrue(all(o.decision == "WATCH" for o in opportunities))
+        self.assertTrue(all(o.verification_status == "unsupported" for o in opportunities))
+        self.assertTrue(all(o.flip_score is None for o in opportunities))
+        mock_identify.assert_not_called()
+        mock_comparables.assert_not_called()
+
+    def test_turners_gets_the_full_research_budget_despite_trademe_candidates(self):
+        # 8 Turners candidates (more than max_research_items=5) alongside 2
+        # Trade Me candidates. Previously Trade Me could take one of the 5
+        # slots away from Turners via the round-robin; now all 5 slots go
+        # to Turners regardless of how many Trade Me candidates exist.
+        opportunities, mock_identify, _ = self._run_with_full_pipeline_mocked(turners_n=8, trademe_n=2)
+
+        turners_opps = [o for o in opportunities if o.source == "Turners"]
+        trademe_opps = [o for o in opportunities if o.source == "Trade Me"]
+        self.assertEqual(len(turners_opps), 5)  # full max_research_items budget, all Turners
+        self.assertEqual(len(trademe_opps), 2)  # both still preserved, uncapped
+        self.assertEqual(mock_identify.call_count, 5)
+
+    def test_ai_and_tavily_research_call_counts_unchanged_by_trademe_presence(self):
+        # 5 Turners candidates with zero Trade Me candidates must produce
+        # identical identify_product/research_comparables call counts to
+        # the same 5 Turners candidates alongside 3 extra Trade Me
+        # candidates -- proving Trade Me's presence never adds to (or
+        # removes from) the paid research cost.
+        _, mock_identify_without, mock_comparables_without = self._run_with_full_pipeline_mocked(
+            turners_n=5, trademe_n=0
+        )
+        _, mock_identify_with, mock_comparables_with = self._run_with_full_pipeline_mocked(
+            turners_n=5, trademe_n=3
+        )
+
+        self.assertEqual(mock_identify_without.call_count, 5)
+        self.assertEqual(mock_identify_without.call_count, mock_identify_with.call_count)
+        self.assertEqual(mock_comparables_without.call_count, mock_comparables_with.call_count)
+
+    def test_run_metadata_distinguishes_total_from_researched_candidates(self):
+        self.mock_auction_source.search.return_value = self._turners_candidates(8)
+        self.mock_source.search.return_value = self._trademe_candidates(3)
+
+        captured_meta = {}
+
+        def _capture_write(opportunities, run_meta, *a, **kw):
+            captured_meta.update(run_meta)
+            return "reports/discovery_test.json", {}
+
+        with mock.patch("scanner.discover.write_discovery_report", side_effect=_capture_write):
+            with mock.patch("scanner.discover.verify_listing", side_effect=self._verify_side_effect()):
+                with mock.patch("scanner.discover.identify_product") as mock_identify:
+                    with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                        with mock.patch("scanner.discover.research", return_value={}):
+                            with mock.patch("scanner.discover.trader_review") as mock_trader:
+                                mock_identify.return_value = ProductIdentification()
+                                mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                                run_discovery(self._config())
+
+        # 8 Turners + 3 Trade Me = 11 individual-listing candidates found
+        # this run -- the true funnel size, independent of the cap.
+        self.assertEqual(captured_meta["candidates_found"], 11)
+        # Only max_research_items=5 Turners candidates were selected for
+        # (and consumed) the paid research pipeline.
+        self.assertEqual(captured_meta["candidates_selected_for_research"], 5)
+        self.assertEqual(captured_meta["candidates_verified"], 5)
+        self.assertEqual(captured_meta["candidates_verification_unsupported"], 3)
+        self.assertEqual(captured_meta["candidates_verification_dropped"], 0)
+
+    def test_run_metadata_candidates_found_can_exceed_selected_when_no_bypass_candidates(self):
+        # Sanity check the two metadata fields are independent even in the
+        # Turners-only case (no bypass candidates at all): candidates_found
+        # and candidates_selected_for_research both equal the same number
+        # only because every candidate happened to be Turners-eligible AND
+        # fit within the cap -- not because they're aliases of each other.
+        self.mock_auction_source.search.return_value = self._turners_candidates(3)
+        self.mock_source.search.return_value = []
+
+        captured_meta = {}
+
+        def _capture_write(opportunities, run_meta, *a, **kw):
+            captured_meta.update(run_meta)
+            return "reports/discovery_test.json", {}
+
+        with mock.patch("scanner.discover.write_discovery_report", side_effect=_capture_write):
+            with mock.patch("scanner.discover.verify_listing", side_effect=self._verify_side_effect()):
+                with mock.patch("scanner.discover.identify_product") as mock_identify:
+                    with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                        with mock.patch("scanner.discover.research", return_value={}):
+                            with mock.patch("scanner.discover.trader_review") as mock_trader:
+                                mock_identify.return_value = ProductIdentification()
+                                mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                                run_discovery(self._config())
+
+        self.assertEqual(captured_meta["candidates_found"], 3)
+        self.assertEqual(captured_meta["candidates_selected_for_research"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

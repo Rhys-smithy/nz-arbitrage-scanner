@@ -443,12 +443,43 @@ def run_discovery(config: dict) -> list[Opportunity]:
     # for any unrecognised domain rather than "unknown", so a naive
     # "!= unknown" check let almost everything through).
     candidates = [r for r in deduped if is_individual_listing_url(r.url)]
+    # Phase 4B.4: true funnel size -- every individual-listing candidate
+    # found this run, independent of max_research_items. Previously this
+    # variable was assigned AFTER the cap below, so "candidates_found" in
+    # run_meta was actually a post-cap count wearing a pre-cap name.
+    candidates_found = len(candidates)
+
+    # Phase 4B.4: max_research_items only rations the paid AI-research
+    # pipeline (identify_product/research_comparables/research/
+    # trader_review, below) -- and only a Turners candidate can ever enter
+    # that pipeline: verify_listing() has no verifier for any other source
+    # and returns "unsupported" for all of them with zero HTTP/AI/Tavily
+    # cost (see scanner/listing_verification.py's _UNSUPPORTED_REASONS and
+    # its final unrecognised-source fallback). A Trade Me candidate winning
+    # one of the 5 round-robin slots therefore never saved any AI budget --
+    # it only ever cost a Turners candidate its shot at the real research
+    # pipeline, for no compensating saving. So: only Turners-group
+    # candidates compete for the capped slots below; every "other"-group
+    # candidate (Trade Me today, anything else verify_listing() can't
+    # verify tomorrow) bypasses the cap entirely and flows into the exact
+    # same verification loop as before -- today that always resolves to
+    # "unsupported" and is preserved as a free WATCH opportunity (see
+    # _build_unverified_watch_opportunity), just for however many such
+    # candidates discovery actually found, not capped at whatever's left
+    # over from Turners' round-robin share.
+    research_eligible = [r for r in candidates if _candidate_group(r) != "other"]
+    bypass_candidates = [r for r in candidates if _candidate_group(r) == "other"]
 
     # See _select_research_candidates() docstring above for the full
     # rationale (Run #35 live validation finding: cheapest-first alone let
     # $1 General Goods starting bids consume the whole research budget).
-    candidates = _select_research_candidates(candidates, max_research, prefer_below)
-    candidates_found = len(candidates)
+    # Only research_eligible (turners_general_goods/turners_vehicles) is
+    # passed in now, so _select_research_candidates()'s "other" bucket is
+    # always empty here and every max_research slot goes to Turners.
+    research_eligible = _select_research_candidates(research_eligible, max_research, prefer_below)
+    candidates_selected_for_research = len(research_eligible)
+
+    candidates = research_eligible + bypass_candidates
 
     # Phase 4B.1: a candidate's price (and everything downstream of it --
     # product ID, comparable research, valuation, Flip Score) must never be
@@ -592,6 +623,14 @@ def run_discovery(config: dict) -> list[Opportunity]:
         "mode": "discover",
         "queries_run": len(queries),
         "candidates_found": candidates_found,
+        # Phase 4B.4: the subset of candidates_found that competed for (and
+        # was capped by) max_research_items -- Turners-eligible candidates
+        # only. Unsupported-source candidates bypass this cap entirely (see
+        # research_eligible/bypass_candidates above), so this number can be
+        # smaller than candidates_verified + candidates_verification_*
+        # combined; it specifically answers "how much of the AI-research
+        # budget did this run use out of what was available".
+        "candidates_selected_for_research": candidates_selected_for_research,
         "candidates_verified": len(verified_candidates),
         # Phase 4B.3: split out from candidates_verification_dropped --
         # these were preserved as WATCH opportunities (see
