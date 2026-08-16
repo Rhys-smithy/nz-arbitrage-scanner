@@ -12,10 +12,12 @@ it has its own freshness store (scanner/discovery_store.py).
 """
 from __future__ import annotations
 
-from datetime import date
+from collections import Counter
+from datetime import date, datetime, timezone
 
 from scanner.bundle import value_bundle
 from scanner.comparable_research import extract_price, research_comparables
+from scanner.discovery_report import update_discovery_index, write_discovery_report
 from scanner.discovery_store import load_discovered, record_sightings, save_discovered
 from scanner.evidence import classify_evidence
 from scanner.flip_score import score_and_decide
@@ -381,6 +383,7 @@ def run_discovery(config: dict) -> list[Opportunity]:
     # rationale (Run #35 live validation finding: cheapest-first alone let
     # $1 General Goods starting bids consume the whole research budget).
     candidates = _select_research_candidates(candidates, max_research, prefer_below)
+    candidates_found = len(candidates)
 
     # Phase 4B.1: a candidate's price (and everything downstream of it --
     # product ID, comparable research, valuation, Flip Score) must never be
@@ -455,6 +458,12 @@ def run_discovery(config: dict) -> list[Opportunity]:
             # scope to close (see scanner/listing_verification.py's own
             # docstring on what it does and doesn't verify).
             price_type=candidate.price_type,
+            # Phase 4B.2 follow-up (persistence port): same carried-through-
+            # from-pre-verification-candidate rationale as price_type above.
+            buy_now_price=candidate.buy_now_price,
+            reserve_status=candidate.reserve_status,
+            closing_date=candidate.closing_date,
+            starts_on=candidate.starts_on,
             identification=identification,
             valuation=valuation,
         )
@@ -472,6 +481,31 @@ def run_discovery(config: dict) -> list[Opportunity]:
     save_stats(stats)
 
     opportunities.sort(key=lambda o: o.flip_score or 0, reverse=True)
+
+    # Phase 4B.2 (persistence port): persist every Opportunity from this run
+    # (BUY, WATCH, PASS, and PROFITABLE BUT CAPITAL RISK alike) plus the run
+    # metadata already computed above, so a durable, inspectable record
+    # exists that downstream UI/reporting (see scanner/deal_queue_report.py)
+    # can read without recomputing or inventing any valuation/scoring
+    # logic. Written even when opportunities is empty, since the run itself
+    # (queries/candidates/verification counts) is still worth recording for
+    # debugging. Ported manually from commit f75a4eb onto the current
+    # candidate-selection/evidence-tier pipeline -- see
+    # scanner/discovery_report.py, which this does not modify.
+    run_meta = {
+        "run_timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "mode": "discover",
+        "queries_run": len(queries),
+        "candidates_found": candidates_found,
+        "candidates_verified": len(verified_candidates),
+        "candidates_verification_dropped": verification_dropped,
+        "opportunity_count": len(opportunities),
+        "decision_counts": dict(Counter(o.decision for o in opportunities)),
+    }
+    report_path, report_payload = write_discovery_report(opportunities, run_meta)
+    update_discovery_index(report_path, report_payload)
+    print(f"[discover] wrote {len(opportunities)} opportunit{'y' if len(opportunities) == 1 else 'ies'} to {report_path}")
+
     return opportunities
 
 

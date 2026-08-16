@@ -1,0 +1,379 @@
+"""Phase 4B.3: the Deal Queue -- a static HTML view over the persisted
+discovery Opportunity results.
+
+This module does not compute, sort, filter, or reinterpret anything. It
+loads the latest run's already-persisted JSON (scanner/discovery_report.py
+output, found via reports/discovery_index.json) and embeds it verbatim
+into a self-contained HTML file. Every number, label, and grouping the
+page displays is produced client-side, in JavaScript, by reading straight
+from that embedded payload -- there is no second schema and no Python-side
+transformation of Opportunity data. This keeps the same "Python computes,
+nothing else touches the numbers" boundary the rest of the codebase
+already enforces, just extended one layer further: the browser doesn't
+get to touch them either.
+
+The page is a single static file with inline CSS/JS (no build step, no
+new dependency, no server) so it opens directly via file:// -- consistent
+with how reports/opportunities_*.csv|xlsx already work today.
+"""
+from __future__ import annotations
+
+import json
+import os
+from typing import Optional
+
+from scanner.discovery_report import DEFAULT_INDEX_PATH, REPORTS_DIR
+
+DEFAULT_OUTPUT_PATH = os.path.join(REPORTS_DIR, "deal_queue.html")
+
+
+def load_latest_discovery_payload(
+    index_path: str = DEFAULT_INDEX_PATH, reports_dir: str = REPORTS_DIR
+) -> Optional[dict]:
+    """Reads reports/discovery_index.json, resolves its newest entry, and
+    returns that run's full payload dict exactly as
+    scanner/discovery_report.py wrote it. Returns None (not a fabricated
+    empty payload) if no discovery run has ever completed yet, or if the
+    index/latest file can't be read -- callers must treat that as "nothing
+    to render", not as a zero-opportunity run."""
+    if not os.path.exists(index_path):
+        return None
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    reports = index.get("reports") or []
+    if not reports:
+        return None
+
+    latest_filename = reports[0].get("json")
+    if not latest_filename:
+        return None
+
+    latest_path = os.path.join(reports_dir, latest_filename)
+    if not os.path.exists(latest_path):
+        return None
+    try:
+        with open(latest_path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def render_latest_deal_queue(
+    index_path: str = DEFAULT_INDEX_PATH,
+    reports_dir: str = REPORTS_DIR,
+    output_path: str = DEFAULT_OUTPUT_PATH,
+) -> Optional[str]:
+    """Loads the latest persisted discovery payload and writes it out as
+    reports/deal_queue.html (a fixed filename, overwritten every run, so
+    there's always one current view to open -- the timestamped JSON files
+    remain the historical record). Returns the path written, or None if
+    there's no discovery run yet to render."""
+    payload = load_latest_discovery_payload(index_path=index_path, reports_dir=reports_dir)
+    if payload is None:
+        return None
+
+    html = _render_html(payload)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return output_path
+
+
+def _render_html(payload: dict) -> str:
+    # json.dumps() does not escape "/", so a title/url/etc containing the
+    # literal text "</script>" would otherwise close this embedding tag
+    # early -- HTML's script-content parsing is text-based, not JSON-aware.
+    # Escaping the slash keeps the JSON value identical (JSON treats "\/"
+    # and "/" as equivalent) while making it impossible for embedded data
+    # to terminate the tag prematurely.
+    embedded_json = json.dumps(payload).replace("</", "<\\/")
+    return _HTML_HEAD + _HTML_STYLE + _HTML_BODY_START + embedded_json + _HTML_BODY_END + _HTML_SCRIPT + _HTML_FOOT
+
+
+_HTML_HEAD = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deal queue</title>
+"""
+
+_HTML_STYLE = """<style>
+:root {
+  --bg: #f4f5f7; --card: #ffffff; --border: #e2e5ea; --text: #1a2230; --muted: #64748b; --mutedest: #94a3b8;
+  --buy: #16a34a; --buy-bg: #e7f7ee; --watch: #b45309; --watch-bg: #fef3e2;
+  --risk: #6d28d9; --risk-bg: #efe9fb; --pass: #6b7280; --pass-bg: #eef0f3;
+  --accent: #2563eb; --warn: #b45309; --warn-bg: #fef3e2;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+a { color: var(--accent); }
+header.topbar { background: #16202c; color: #fff; padding: 14px 22px; }
+header.topbar .brand { font-weight: 700; letter-spacing: .03em; margin-bottom: 4px; }
+header.topbar .status { color: #cbd5e1; font-size: 12.5px; }
+header.topbar .status b { color: #fff; font-weight: 600; }
+main { max-width: 1000px; margin: 0 auto; padding: 16px 16px 60px; }
+.toolbar { display: flex; justify-content: flex-end; margin-bottom: 10px; }
+.toolbar button { font-size: 12.5px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); cursor: pointer; color: var(--muted); }
+.toolbar button.active { background: var(--text); color: #fff; border-color: var(--text); }
+.queue { background: var(--card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.row { padding: 12px 16px; border-top: 1px solid var(--border); cursor: pointer; }
+.row:first-child { border-top: none; }
+.row:hover { background: #fafbfc; }
+.row-main { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; }
+.row-left { min-width: 0; }
+.row-head { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; flex-wrap: wrap; }
+.pill { font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 20px; letter-spacing: .02em; white-space: nowrap; }
+.pill-buy { background: var(--buy-bg); color: var(--buy); }
+.pill-watch { background: var(--watch-bg); color: var(--watch); }
+.pill-risk { background: var(--risk-bg); color: var(--risk); }
+.pill-pass { background: var(--pass-bg); color: var(--pass); }
+.score { font-size: 12px; color: var(--muted); }
+.title { font-size: 14.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 520px; }
+.source { font-size: 12px; color: var(--mutedest); }
+.row-right { text-align: right; flex-shrink: 0; }
+.price-line { font-size: 17px; font-weight: 600; white-space: nowrap; }
+.price-line .arrow { color: var(--mutedest); font-weight: 400; font-size: 13px; }
+.profit-line { font-size: 13px; color: var(--text); }
+.roi-line { font-size: 12px; color: var(--muted); }
+.no-evidence-flag { font-size: 11px; color: var(--warn); margin-top: 2px; }
+.detail { padding: 14px 18px 20px; background: #fafbfc; border-top: 1px solid var(--border); }
+.detail a.open-listing { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: var(--accent); border: 1px solid var(--border); padding: 7px 14px; border-radius: 8px; background: var(--card); text-decoration: none; margin-bottom: 4px; }
+.sechead { font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 16px 0 6px; }
+.reasons { margin: 0; padding-left: 18px; font-size: 13px; }
+.kv-row { display: flex; justify-content: space-between; font-size: 12.5px; padding: 3px 0; border-top: 1px solid var(--border); }
+.kv-row:first-of-type { border-top: none; }
+.kv-row.total { font-weight: 700; border-top: 1px solid var(--text); margin-top: 2px; padding-top: 5px; }
+.note-box { font-size: 13px; padding: 9px 12px; background: var(--warn-bg); color: var(--warn); border-radius: 8px; margin-top: 6px; }
+.conf-line { font-size: 13px; margin-top: 6px; }
+.evidence-item { border-top: 1px solid var(--border); padding: 8px 0; font-size: 12.5px; }
+.evidence-item:first-of-type { border-top: none; }
+.evidence-top { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+.evidence-badge { font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px; background: var(--pass-bg); color: var(--muted); margin-right: 6px; }
+.evidence-badge.sold { background: var(--buy-bg); color: var(--buy); }
+.evidence-meta { color: var(--muted); margin-top: 2px; }
+.empty-note { font-size: 12.5px; color: var(--muted); font-style: italic; }
+.missing-note { margin-top: 16px; font-size: 11.5px; color: var(--mutedest); border-top: 1px solid var(--border); padding-top: 10px; }
+.empty-run { padding: 30px; text-align: center; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+"""
+
+_HTML_BODY_START = """<body>
+<header class="topbar">
+  <div class="brand">Deal queue</div>
+  <div class="status" id="status-line">Loading...</div>
+</header>
+<main>
+  <div class="toolbar">
+    <button id="toggle-pass">Show passed</button>
+  </div>
+  <div class="queue" id="queue"></div>
+</main>
+<script id="discovery-report-data" type="application/json">"""
+
+_HTML_BODY_END = """</script>
+"""
+
+_HTML_SCRIPT = r"""<script>
+(function () {
+  var payload = JSON.parse(document.getElementById('discovery-report-data').textContent);
+  var opportunities = payload.opportunities || [];
+  var decisionCounts = payload.decision_counts || {};
+  var DECISION_ORDER = ['BUY', 'PROFITABLE BUT CAPITAL RISK', 'WATCH', 'PASS'];
+  var TIER_RANK = { 'BUY': 0, 'PROFITABLE BUT CAPITAL RISK': 1, 'WATCH': 2, 'PASS': 3 };
+  var PILL_CLASS = { 'BUY': 'pill-buy', 'WATCH': 'pill-watch', 'PASS': 'pill-pass', 'PROFITABLE BUT CAPITAL RISK': 'pill-risk' };
+
+  var showPass = false;
+  var expandedUrl = null;
+
+  function money(v) {
+    if (v === null || v === undefined) return '—';
+    var sign = v < 0 ? '-' : '';
+    return sign + '$' + Math.round(Math.abs(v)).toLocaleString();
+  }
+
+  function pct(v) {
+    if (v === null || v === undefined) return '—';
+    return Math.round(v) + '%';
+  }
+
+  function renderStatus() {
+    var counts = DECISION_ORDER.map(function (d) {
+      return (decisionCounts[d] || 0) + ' ' + d;
+    }).join(' · ');
+    var ts = payload.run_timestamp ? new Date(payload.run_timestamp).toLocaleString() : 'unknown';
+    document.getElementById('status-line').innerHTML =
+      'Last scan: <b>' + ts + '</b> · ' + counts;
+  }
+
+  function sortedOpportunities() {
+    var list = opportunities.filter(function (o) { return showPass || o.decision !== 'PASS'; });
+    list.sort(function (a, b) {
+      var ta = TIER_RANK.hasOwnProperty(a.decision) ? TIER_RANK[a.decision] : 99;
+      var tb = TIER_RANK.hasOwnProperty(b.decision) ? TIER_RANK[b.decision] : 99;
+      if (ta !== tb) return ta - tb;
+      return (b.flip_score || 0) - (a.flip_score || 0);
+    });
+    return list;
+  }
+
+  function evidenceTag(type) {
+    var cls = type === 'SOLD' ? 'evidence-badge sold' : 'evidence-badge';
+    return '<span class="' + cls + '">' + (type || 'OTHER').replace('_', ' ').toLowerCase() + '</span>';
+  }
+
+  function renderDetail(o) {
+    var val = o.valuation || {};
+    var costs = o.costs || {};
+    var ident = o.identification || {};
+    var reasons = (o.decision_reasons || []).map(function (r) { return '<li>' + escapeHtml(r) + '</li>'; }).join('');
+
+    var identLine = [ident.brand, ident.model].filter(Boolean).join(' ') || 'Brand/model not identified';
+    if (ident.is_bundle) identLine += ' · bundle/lot';
+    var identSub = 'Condition risk: ' + (ident.condition_risk_level || 'unknown') +
+      (ident.condition_risk_phrases && ident.condition_risk_phrases.length ? ' (' + ident.condition_risk_phrases.join(', ') + ')' : '') +
+      ' · ' + (ident.model_identified_confidently ? 'model identified confidently' : 'model not confidently identified');
+
+    var valLine = 'Quick sale ' + money(val.quick_sale_low) + '–' + money(val.quick_sale_high) +
+      ' (mid ' + money(val.quick_sale_mid) + ') · normal ' + money(val.normal) + ' · optimistic ' + money(val.optimistic);
+
+    var confBlock;
+    if (val.evidence_note) {
+      confBlock = '<div class="note-box">' + escapeHtml(val.evidence_note) +
+        '<div style="margin-top:3px;font-size:11.5px;opacity:.85;">Valuation confidence: ' + pct(val.confidence_pct) + '</div></div>';
+    } else {
+      confBlock = '<div class="conf-line">Valuation confidence: ' + pct(val.confidence_pct) + '</div>';
+    }
+
+    var costRows = [
+      ['Purchase price', costs.purchase_price], ["Buyer's premium", costs.buyer_premium],
+      ['GST', costs.gst], ['Selling fees', costs.selling_fees], ['Payment fees', costs.payment_fees],
+      ['Shipping', costs.shipping], ['Packaging', costs.packaging], ['Repair allowance', costs.repair_allowance],
+      ['Negotiation allowance', costs.negotiation_allowance], ['Other', costs.other],
+    ].filter(function (r) { return r[1] !== null && r[1] !== undefined; })
+     .map(function (r) { return '<div class="kv-row"><span>' + r[0] + '</span><span>' + money(r[1]) + '</span></div>'; }).join('');
+    costRows += '<div class="kv-row"><span>Total excluding purchase</span><span>' + money(costs.total_excluding_purchase) + '</span></div>';
+    costRows += '<div class="kv-row total"><span>Total</span><span>' + money(costs.total) + '</span></div>';
+
+    var evidence = val.evidence || [];
+    var evidenceHtml;
+    if (!evidence.length) {
+      evidenceHtml = '<div class="empty-note">No comparable evidence found for this listing.</div>';
+    } else {
+      evidenceHtml = evidence.map(function (e) {
+        var name = [e.product, e.model].filter(Boolean).join(' ');
+        return '<div class="evidence-item">' +
+          '<div class="evidence-top"><span>' + evidenceTag(e.evidence_type) +
+          '<a href="' + escapeAttr(e.url) + '" target="_blank" rel="noopener">' + escapeHtml(name || e.url) + '</a></span>' +
+          '<span>' + escapeHtml(e.currency || '') + ' ' + money(e.price) + '</span></div>' +
+          '<div class="evidence-meta">' + escapeHtml(e.source || 'unknown source') + ' · condition: ' + escapeHtml(e.condition || 'unknown') +
+          ' · ' + Math.round((e.similarity_score || 0) * 100) + '% title match · observed ' + escapeHtml(e.date_observed || 'unknown date') + '</div>' +
+          '</div>';
+      }).join('');
+    }
+
+    var capitalLine = '';
+    if (o.decision === 'PROFITABLE BUT CAPITAL RISK' && o.capital_concentration_pct !== null && o.capital_concentration_pct !== undefined) {
+      capitalLine = '<div style="font-size:13px;margin-top:4px;">' + Math.round(o.capital_concentration_pct) + '% of bankroll</div>';
+    }
+
+    return '<div class="detail">' +
+      '<a class="open-listing" href="' + escapeAttr(o.url) + '" target="_blank" rel="noopener">Open listing ↗</a>' +
+      capitalLine +
+      '<div class="sechead">Decision reasons</div><ul class="reasons">' + (reasons || '<li>none recorded</li>') + '</ul>' +
+      '<div class="sechead">Product identification</div><div style="font-size:13px;">' + escapeHtml(identLine) + '</div>' +
+      '<div style="font-size:12px;color:var(--muted);">' + escapeHtml(identSub) + '</div>' +
+      '<div class="sechead">Valuation</div><div style="font-size:13px;">' + valLine + '</div>' + confBlock +
+      '<div class="sechead">Cost breakdown</div>' + costRows +
+      '<div class="sechead">Comparable evidence (' + evidence.length + ')</div>' + evidenceHtml +
+      '<div class="missing-note">Auction closing time, listing condition, listing location, image, seller status and researcher/trader reasoning are not currently part of the scanner’s persisted output for this item.</div>' +
+      '</div>';
+  }
+
+  function renderRow(o) {
+    var bidRoomLine = '';
+    if (o.bidding_room !== null && o.bidding_room !== undefined) {
+      bidRoomLine = '<div class="roi-line">' + money(o.bidding_room) + ' bidding room</div>';
+    }
+    var noEvidenceFlag = (!o.valuation || !(o.valuation.evidence || []).length)
+      ? '<div class="no-evidence-flag">No comparable evidence</div>' : '';
+
+    var rowHtml =
+      '<div class="row-main">' +
+      '<div class="row-left">' +
+      '<div class="row-head">' +
+      '<span class="pill ' + (PILL_CLASS[o.decision] || 'pill-pass') + '">' + escapeHtml(o.decision) + '</span>' +
+      '<span class="score">' + (o.flip_score === null || o.flip_score === undefined ? '—' : o.flip_score) + '/100 · ' + (o.flip_score_band || '').toLowerCase() + '</span>' +
+      '</div>' +
+      '<div class="title">' + escapeHtml(o.title || '(untitled)') + '</div>' +
+      '<div class="source">' + escapeHtml(o.source || 'unknown source') + '</div>' +
+      '</div>' +
+      '<div class="row-right">' +
+      '<div class="price-line">' + money(o.current_price) + '<span class="arrow"> → </span>' + money(o.max_buy_price) + '</div>' +
+      '<div class="profit-line">profit ' + money(o.expected_net_profit_low) + '–' + money(o.expected_net_profit_high) + '</div>' +
+      '<div class="roi-line">roi ' + pct(o.roi_low_pct) + '–' + pct(o.roi_high_pct) + '</div>' +
+      bidRoomLine + noEvidenceFlag +
+      '</div>' +
+      '</div>';
+
+    var row = document.createElement('div');
+    row.className = 'row';
+    row.dataset.url = o.url || '';
+    row.innerHTML = rowHtml;
+    row.addEventListener('click', function (e) {
+      if (e.target.closest('a')) return;
+      expandedUrl = (expandedUrl === o.url) ? null : o.url;
+      render();
+    });
+
+    if (expandedUrl === o.url) {
+      var detailWrap = document.createElement('div');
+      detailWrap.innerHTML = renderDetail(o);
+      detailWrap.firstChild.addEventListener('click', function (e) { e.stopPropagation(); });
+      row.appendChild(detailWrap.firstChild);
+    }
+    return row;
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function escapeAttr(s) { return escapeHtml(s); }
+
+  function render() {
+    var queue = document.getElementById('queue');
+    queue.innerHTML = '';
+    var list = sortedOpportunities();
+    if (!list.length) {
+      var empty = document.createElement('div');
+      empty.className = 'empty-run';
+      empty.textContent = showPass ? 'No opportunities in this run.' : 'No BUY/WATCH/CAPITAL RISK opportunities this run. Try "Show passed".';
+      queue.appendChild(empty);
+      return;
+    }
+    list.forEach(function (o) { queue.appendChild(renderRow(o)); });
+  }
+
+  document.getElementById('toggle-pass').addEventListener('click', function () {
+    showPass = !showPass;
+    this.classList.toggle('active', showPass);
+    this.textContent = showPass ? 'Hide passed' : 'Show passed';
+    render();
+  });
+
+  renderStatus();
+  render();
+})();
+</script>
+"""
+
+_HTML_FOOT = """</body>
+</html>
+"""

@@ -111,6 +111,18 @@ class Opportunity:
     # with zero bids placed -- valuation.py must not treat that as a
     # confirmed acquisition price. None for non-Turners sources / unknown.
     price_type: Optional[str] = None
+    # Phase 4B.2 follow-up (persistence port): same rationale as price_type
+    # above -- carried straight through from the discovery candidate's
+    # SearchResult fields (see scanner/search/base.py) so the persisted
+    # Opportunity record is self-contained for inspecting *why* a decision
+    # was made, without a UI/report needing to go back to the raw
+    # SearchResult. All optional/defaulted, same as on SearchResult --
+    # None/"" for any source that doesn't scrape them (non-Turners sources,
+    # and Turners Vehicles for reserve_status/closing_date/starts_on).
+    buy_now_price: Optional[float] = None
+    reserve_status: Optional[str] = None
+    closing_date: str = ""
+    starts_on: str = ""
     identification: ProductIdentification = field(default_factory=ProductIdentification)
     valuation: ResaleValuation = field(default_factory=ResaleValuation)
     costs: CostBreakdown = field(default_factory=CostBreakdown)

@@ -322,6 +322,18 @@ class _RunDiscoveryTestBase(unittest.TestCase):
             mock.patch("scanner.discover.load_discovered", return_value={}),
             mock.patch("scanner.discover.WebSearchSource"),
             mock.patch("scanner.discover.AuctionSearchSource"),
+            # Phase 4B.2 follow-up (persistence port): these tests exercise
+            # run_discovery() end-to-end and must not write real files to
+            # the actual reports/ directory as a side effect -- persistence
+            # itself is covered separately and thoroughly by
+            # tests/test_discovery_report.py. Appended at the end (not
+            # inserted earlier in the list) so the existing self.mocks[4]/
+            # [5] index references below are unaffected.
+            mock.patch(
+                "scanner.discover.write_discovery_report",
+                return_value=("reports/discovery_test.json", {}),
+            ),
+            mock.patch("scanner.discover.update_discovery_index"),
         ]
         self.mocks = [p.start() for p in patches]
         for p in patches:
