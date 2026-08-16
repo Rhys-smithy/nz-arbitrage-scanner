@@ -26,6 +26,7 @@ from scanner.notifier import build_flip_alert, send_telegram_message
 from scanner.product_id import detect_condition_risk, identify_product
 from scanner.query_generator import allocate_discovery_queries
 from scanner.researcher import research
+from scanner.search.auction_search import AuctionSearchSource
 from scanner.search.util import canonicalize_url, identify_marketplace, is_individual_listing_url
 from scanner.search.web_search import WebSearchSource
 from scanner.search_stats import (
@@ -123,12 +124,19 @@ def run_discovery(config: dict) -> list[Opportunity]:
               "Set it to true (and configure a web search provider) to run this mode.")
         return []
 
+    # Tavily/web-search unavailability must only skip the Tavily-side path
+    # below -- it must NOT exit run_discovery() early. AuctionSearchSource
+    # (Turners direct-scrape discovery, see below) has its own working
+    # scrapers and doesn't depend on a web search provider at all; the old
+    # hard `return []` here predates AuctionSearchSource being wired into
+    # this function and was only ever correct back when Tavily was the sole
+    # candidate source discover.py had.
     web_search = WebSearchSource()
     if not web_search.available:
         print("[discover] No web search provider configured (set WEB_SEARCH_PROVIDER + "
               "its API key env var, e.g. WEB_SEARCH_PROVIDER=tavily + TAVILY_API_KEY). "
-              "Nothing to discover -- exiting rather than fabricating results.")
-        return []
+              "Tavily-based web search discovery will be skipped this run -- continuing "
+              "with Turners direct-scrape discovery (AuctionSearchSource) only.")
 
     max_queries = discovery_cfg.get("max_queries_per_run", 15)
     max_results = discovery_cfg.get("max_results_per_query", 8)
@@ -159,22 +167,63 @@ def run_discovery(config: dict) -> list[Opportunity]:
     discovery_domains = discovery_cfg.get("include_domains") or DEFAULT_DISCOVERY_DOMAINS
     discovery_domains = [d for d in discovery_domains if d.lower() not in _EBAY_DOMAINS]
 
-    queries = allocate_discovery_queries(
-        products=products,
-        concepts=concepts,
-        max_queries=max_queries,
-        bare_product_min_ratio=bare_product_min_ratio,
-        seed=rotation_seed,
-    )
-
-    print(f"[discover] running {len(queries)} discovery quer{'y' if len(queries)==1 else 'ies'} "
-          f"across {len(products)} product(s), restricted to domains: {', '.join(discovery_domains)}")
+    if web_search.available:
+        queries = allocate_discovery_queries(
+            products=products,
+            concepts=concepts,
+            max_queries=max_queries,
+            bare_product_min_ratio=bare_product_min_ratio,
+            seed=rotation_seed,
+        )
+        print(f"[discover] running {len(queries)} discovery quer{'y' if len(queries)==1 else 'ies'} "
+              f"across {len(products)} product(s), restricted to domains: {', '.join(discovery_domains)}")
+    else:
+        # Nothing to allocate a Tavily query budget for -- Turners discovery
+        # below doesn't use `queries` at all.
+        queries = []
 
     stats = load_stats()
     discovered_store = load_discovered()
     all_results = []
     deduped = []
     seen_canonical: set = set()
+
+    # Turners (General Goods + Vehicles) already has working scrapers that
+    # reach real inventory directly, unlike Tavily web search, which rarely
+    # surfaces individual Turners listings (see Runs #28-30). Processed FIRST
+    # so its canonical URLs populate seen_canonical before the Tavily loop
+    # below -- if the same listing also comes back from Tavily, the Turners
+    # copy (already carrying a real scraped price) wins the duplicate, and
+    # the Tavily copy is dropped as `rejected_duplicate`. Reuses the same
+    # _process_query_results()/candidates/verification/valuation pipeline as
+    # every other source -- no special-casing downstream of this point.
+    auction_source = AuctionSearchSource(config)
+    try:
+        auction_results = auction_source.search()
+    except Exception as e:
+        # AuctionSearchSource already swallows its own scraper-level
+        # failures (see scanner/search/auction_search.py) -- this is a
+        # last-resort guard so an unexpected failure here can never take
+        # down the Tavily loop below it in the same run.
+        print(f"[discover]   auction source failed unexpectedly: {e}")
+        auction_results = []
+    for r in auction_results:
+        r._discovery_concept = None  # not part of Tavily's concept-rotation stats
+    all_results.extend(auction_results)
+    auction_log_entry, auction_unique = _process_query_results(
+        "auction_source:turners", ["turners.co.nz", "thorntons.net.nz", "mainlandauctions.nz"],
+        auction_results, seen_canonical,
+    )
+    deduped.extend(auction_unique)
+    print(
+        f"[discover]   source=auction raw={auction_log_entry['raw_results']} "
+        f"unique={auction_log_entry['unique_results']} "
+        f"valid_listings={auction_log_entry['valid_individual_listings']} "
+        f"rejected(duplicate={auction_log_entry['rejected_duplicate']}, "
+        f"not_individual_listing={auction_log_entry['rejected_not_individual_listing']}, "
+        f"ebay={auction_log_entry['rejected_ebay']})"
+    )
+
     for query in queries:
         results = web_search.search(query, max_results=max_results, include_domains=discovery_domains)
         concept = extract_concept_from_query(query, concepts)
