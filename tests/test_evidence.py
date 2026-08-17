@@ -67,6 +67,16 @@ class TestCurrencyConversion(unittest.TestCase):
         price2, _ = convert_to_nzd(100, "USD")
         self.assertEqual(price1, price2)
 
+    def test_cad_converted(self):
+        price, converted = convert_to_nzd(100, "CAD")
+        self.assertTrue(converted)
+        self.assertGreater(price, 100)
+
+    def test_sgd_converted(self):
+        price, converted = convert_to_nzd(100, "SGD")
+        self.assertTrue(converted)
+        self.assertGreater(price, 100)
+
 
 if __name__ == "__main__":
     unittest.main()
