@@ -219,9 +219,11 @@ class TestCandidateGroup(unittest.TestCase):
 
 
 class TestSelectResearchCandidates(unittest.TestCase):
-    """Phase 4B follow-up: the round-robin/evidence-tier replacement for the
-    old global cheapest-first sort+slice. See _select_research_candidates()
-    docstring in scanner/discover.py for the full rationale."""
+    """Phase 4B follow-up + Run #40 business-priority change: strict
+    General-Goods-before-Vehicles tier fill (replacing the earlier round
+    robin) layered on top of the within-group evidence-tier/price sort.
+    See _select_research_candidates() docstring in scanner/discover.py and
+    _RESEARCH_PRIORITY_ORDER's comment for the full rationale."""
 
     def _gg(self, n, price=1.0, price_type="starting_bid", reserve_status=None):
         return [
@@ -241,19 +243,58 @@ class TestSelectResearchCandidates(unittest.TestCase):
             for i in range(n)
         ]
 
-    def test_general_goods_cannot_completely_starve_vehicles(self):
-        # This is exactly Run #35's observed failure mode: a large pool of
-        # $1 starting-bid General Goods candidates (131 raw that run) vs a
-        # much smaller Vehicles pool (80 raw that run) -- General Goods
-        # must no longer be able to take every one of max_research_items'
-        # slots purely by outnumbering Vehicles and sorting first.
-        candidates = self._gg(40) + self._vehicles(3)  # GG appended first, same as config order
+    def test_high_priority_general_goods_takes_all_slots_over_vehicles(self):
+        # Run #40 business-priority change (supersedes the old Run #35
+        # anti-starvation round robin, which is exactly what this test
+        # replaces): when General Goods has enough viable candidates to
+        # fill the entire research budget on its own, Vehicles must get
+        # ZERO slots -- the $500->$10k strategy has explicitly asked that
+        # cars/motorcycles/heavy machinery not consume scarce paid-research
+        # capacity while higher-priority small/medium goods are available.
+        candidates = self._gg(40) + self._vehicles(3)
         selected = _select_research_candidates(candidates, max_research=5, prefer_below=250)
 
         groups = {_candidate_group(r) for r in selected}
-        self.assertIn("turners_vehicles", groups)
+        self.assertNotIn("turners_vehicles", groups)
+        self.assertEqual(len(selected), 5)
+        self.assertTrue(all(_candidate_group(r) == "turners_general_goods" for r in selected))
+
+    def test_vehicles_receive_overflow_slots_when_general_goods_pool_exhausted(self):
+        # Vehicles are deprioritised, not excluded: discovery still finds
+        # and persists them (see _RESEARCH_PRIORITY_ORDER's comment), and
+        # if General Goods can't fill the whole budget on its own this run,
+        # the leftover slots roll over to Vehicles rather than going unused.
+        candidates = self._gg(2) + self._vehicles(5)
+        selected = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+
+        self.assertEqual(len(selected), 5)
+        gg_count = sum(1 for r in selected if _candidate_group(r) == "turners_general_goods")
         vehicle_count = sum(1 for r in selected if _candidate_group(r) == "turners_vehicles")
-        self.assertGreaterEqual(vehicle_count, 1)
+        self.assertEqual(gg_count, 2)   # both available GG candidates used
+        self.assertEqual(vehicle_count, 3)  # remaining 3 slots roll over to Vehicles
+
+    def test_vehicle_tier_internal_ordering_unchanged_by_priority_change(self):
+        # Requirement 3: within a single tier (here, Vehicles alone, no
+        # General Goods candidates competing at all), the existing
+        # evidence-tier/price sort_key ordering must be untouched by the
+        # priority-order change -- a real-bid vehicle still beats a
+        # cheaper, unevidenced one, exactly as it would within General
+        # Goods (see test_evidence_tier_beats_cheaper_but_unevidenced_
+        # candidate_within_a_group above).
+        cheap_unevidenced = _auction_result(
+            "https://www.turners.co.nz/Cars/Used-Cars-for-Sale/1/",
+            title="Cheap unevidenced vehicle", price=1.0, price_type="starting_bid",
+        )
+        real_bid = _auction_result(
+            "https://www.turners.co.nz/Cars/Used-Cars-for-Sale/2/",
+            title="Real bidding vehicle", price=500.0, price_type="current_bid", reserve_status="Reserve Met",
+        )
+        selected = _select_research_candidates(
+            [cheap_unevidenced, real_bid], max_research=1, prefer_below=250
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].title, "Real bidding vehicle")
 
     def test_evidence_tier_beats_cheaper_but_unevidenced_candidate_within_a_group(self):
         cheap_starting_bid = _auction_result(
@@ -671,12 +712,20 @@ class TestRunDiscoveryAuctionSourceCandidates(_RunDiscoveryTestBase):
         mock_identify.assert_not_called()
 
 
-class TestRunDiscoveryVehiclesNotStarvedByGeneralGoods(_RunDiscoveryTestBase):
-    """End-to-end regression test for Run #35's observed failure mode: a
-    large pool of $1 starting-bid General Goods candidates must not be able
-    to consume every max_research_items slot and lock Vehicles out
-    entirely, purely because General Goods is scraped first and both sides
-    tie on price."""
+class TestRunDiscoveryGeneralGoodsPrioritisedOverVehiclesEndToEnd(_RunDiscoveryTestBase):
+    """End-to-end regression test for the Run #40 business-priority change:
+    when General Goods has enough viable candidates to fill the whole
+    max_research_items budget on its own, Vehicles must receive ZERO paid
+    research this run -- all the way through to identify_product(), not
+    just inside _select_research_candidates() in isolation.
+
+    This replaces the pre-Run-#40 guarantee (Run #35's failure mode: a
+    large pool of $1 starting-bid General Goods candidates locking
+    Vehicles out by outnumbering them) -- that protection produced exactly
+    the outcome asserted here now, deliberately, as a business decision
+    rather than a bug: Run #40 spent 2 of 5 research slots on a motorbike
+    and a farm bike, categories the $500->$10k strategy has asked to
+    deprioritise for paid research."""
 
     def setUp(self):
         super().setUp()
@@ -700,7 +749,62 @@ class TestRunDiscoveryVehiclesNotStarvedByGeneralGoods(_RunDiscoveryTestBase):
         # AuctionSearchSource.search()'s iteration order.
         self.mock_auction_source.search.return_value = gg_candidates + vehicle_candidates
 
-    def test_at_least_one_vehicle_candidate_reaches_identify_product(self):
+    def _run(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.side_effect = lambda url, cache: mock.Mock(
+                                status="verified", price=1.0, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            run_discovery(self._config())
+        return {call.args[0] for call in mock_identify.call_args_list}
+
+    def test_no_vehicle_candidate_reaches_identify_product_when_gg_pool_is_sufficient(self):
+        identified_titles = self._run()
+        vehicle_titles = {t for t in identified_titles if t.startswith("Vehicle")}
+        self.assertEqual(
+            len(vehicle_titles), 0,
+            f"expected zero Vehicle candidates among identified titles (GG pool of 40 "
+            f"exceeds the max_research_items=5 budget on its own), got: {identified_titles}",
+        )
+
+    def test_general_goods_fills_the_entire_budget_instead(self):
+        identified_titles = self._run()
+        gg_titles = {t for t in identified_titles if t.startswith("GG item")}
+        self.assertEqual(len(gg_titles), 5)
+
+
+class TestRunDiscoveryVehiclesGetOverflowSlotsEndToEnd(_RunDiscoveryTestBase):
+    """Companion to the class above: Vehicles are deprioritised, not
+    excluded. When General Goods can't fill the whole max_research_items
+    budget on its own this run, the leftover slots must still roll over to
+    Vehicles end-to-end -- proving discovery still finds/researches
+    vehicle candidates, just only once higher-priority candidates run
+    out."""
+
+    def setUp(self):
+        super().setUp()
+        gg_candidates = [
+            _auction_result(
+                f"https://www.turners.co.nz/General-Goods/Search/electronics/cameras/{i}/",
+                title=f"GG item {i}", price=1.0, price_type="starting_bid",
+            )
+            for i in range(2)  # fewer than max_research_items=5
+        ]
+        vehicle_candidates = [
+            _auction_result(
+                f"https://www.turners.co.nz/Cars/Used-Cars-for-Sale/{200000 + i}/",
+                title=f"Vehicle {i}", price=1.0, price_type="current_bid",
+            )
+            for i in range(5)
+        ]
+        self.mock_auction_source.search.return_value = gg_candidates + vehicle_candidates
+
+    def test_vehicles_fill_the_leftover_research_slots(self):
         with mock.patch("scanner.discover.verify_listing") as mock_verify:
             with mock.patch("scanner.discover.identify_product") as mock_identify:
                 with mock.patch("scanner.discover.research_comparables", return_value=[]):
@@ -714,11 +818,10 @@ class TestRunDiscoveryVehiclesNotStarvedByGeneralGoods(_RunDiscoveryTestBase):
                             run_discovery(self._config())
 
         identified_titles = {call.args[0] for call in mock_identify.call_args_list}
+        gg_titles = {t for t in identified_titles if t.startswith("GG item")}
         vehicle_titles = {t for t in identified_titles if t.startswith("Vehicle")}
-        self.assertGreaterEqual(
-            len(vehicle_titles), 1,
-            f"expected at least one Vehicle candidate among identified titles, got: {identified_titles}",
-        )
+        self.assertEqual(len(gg_titles), 2)      # both GG candidates used
+        self.assertEqual(len(vehicle_titles), 3)  # remaining 3 of the 5-slot budget roll over
 
 
 class TestRunDiscoveryStartingBidValuationSemantics(_RunDiscoveryTestBase):

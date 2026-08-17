@@ -133,6 +133,30 @@ def _process_query_results(
 
 _CANDIDATE_GROUP_ORDER = ["turners_general_goods", "turners_vehicles", "other"]
 
+# Business-priority order for the paid-research allocation only (see
+# _select_research_candidates() below) -- has no effect on discovery,
+# candidate counting, verification, or the WATCH-preservation path, all of
+# which still see every candidate exactly as before.
+#
+# Run #40 live validation (2026-08-17): the $500->$10k strategy targets
+# small/medium, high-value-density physical goods (electronics, tools,
+# collectables, hobby items, etc. -- everything Turners' General Goods
+# catalog covers) and has explicitly asked to deprioritise cars,
+# motorcycles, heavy/agricultural machinery, and trailers/caravans (i.e.
+# every turners_vehicles candidate -- see turners_vehicles.VEHICLE_
+# CATEGORIES) for the *paid* research budget specifically: that run spent
+# 2 of 5 research slots (40%) on a motorbike and a farm bike under the old
+# round-robin allocation. turners_general_goods now gets first claim on
+# every max_research_items slot; turners_vehicles only receives a slot
+# once every general-goods candidate that wants one this run has already
+# been served. Vehicles are not excluded -- a run with fewer general-goods
+# candidates than the budget still lets vehicles fill the leftover slots
+# (see test_vehicles_receive_overflow_slots_when_general_goods_pool_
+# exhausted in tests/test_discover.py), and every vehicle candidate is
+# still found, counted in candidates_found, and logged exactly as before
+# -- this constant only decides who wins a scarce research slot.
+_RESEARCH_PRIORITY_ORDER = ["turners_general_goods", "turners_vehicles"]
+
 
 def _candidate_group(result) -> str:
     """Classifies a candidate for FAIR SLOT ALLOCATION only, not for
@@ -193,7 +217,7 @@ def _select_research_candidates(candidates: list, max_research: int, prefer_belo
     turners_categories order, won every $1 tie via Python's stable sort,
     and all 5 research slots went to General Goods).
 
-    Two independent fixes:
+    Two independent pieces:
 
     1. Within each source group, order by (acquisition evidence tier,
        over-budget, price) -- see _acquisition_evidence_tier(). The
@@ -201,13 +225,18 @@ def _select_research_candidates(candidates: list, max_research: int, prefer_belo
        as before, just demoted beneath the new evidence tier so a
        real-bid/buy-now candidate no longer loses to a cheaper but
        unevidenced $1 starting bid.
-    2. Across groups (Turners General Goods / Turners Vehicles / everything
-       else -- Tavily-sourced TradeMe/Thorntons/Mainland/other Turners
-       hits), allocate max_research_items by round robin: one slot per
-       non-exhausted group per round. Mirrors the existing round-robin
-       pattern already in this codebase (query_generator.py's
-       _round_robin_fill(), used for Tavily query allocation), applied
-       here to candidate selection instead.
+    2. Across groups, fill by strict business-priority order
+       (_RESEARCH_PRIORITY_ORDER: Turners General Goods before Turners
+       Vehicles) rather than round robin -- see _RESEARCH_PRIORITY_ORDER's
+       comment for the Run #40 rationale. General Goods claims every slot
+       it can fill first; Vehicles only receives the leftover slots once
+       General Goods' pool for this run is exhausted, so Vehicles are
+       deprioritised, not excluded -- a run without enough General Goods
+       candidates to fill the budget still lets Vehicles use the rest.
+       (Prior to this, an earlier fix used one-slot-per-group round robin
+       purely to stop General Goods from starving Vehicles to zero by
+       outnumbering it; that protection is superseded by the Run #40
+       business decision to deprioritise Vehicles deliberately.)
 
     Deterministic and side-effect-free: same input always produces the
     same output, no randomness, no estimated/invented prices.
@@ -226,20 +255,11 @@ def _select_research_candidates(candidates: list, max_research: int, prefer_belo
         groups[name].sort(key=sort_key)
 
     selected: list = []
-    next_index = {name: 0 for name in _CANDIDATE_GROUP_ORDER}
-    while len(selected) < max_research:
-        made_progress = False
-        for name in _CANDIDATE_GROUP_ORDER:
-            if len(selected) >= max_research:
-                break
-            i = next_index[name]
-            pool = groups[name]
-            if i < len(pool):
-                selected.append(pool[i])
-                next_index[name] = i + 1
-                made_progress = True
-        if not made_progress:
-            break  # every group exhausted before the budget was fully used
+    for name in _RESEARCH_PRIORITY_ORDER:
+        if len(selected) >= max_research:
+            break
+        remaining = max_research - len(selected)
+        selected.extend(groups[name][:remaining])
     return selected
 
 
