@@ -64,15 +64,27 @@ def trader_review(
     costs_excl_purchase: float,
     bankroll: float,
     api_key: str,
+    model_identified_confidently: bool = False,
 ) -> tuple[ResaleValuation, dict]:
     """Returns (possibly-adjusted ResaleValuation, trader_verdict dict).
 
     If no API key / call fails: returns the original evidence-based
     valuation unchanged, with a verdict noting the trader pass didn't run
     (never silently pretends a review happened).
+
+    `model_identified_confidently` must come from the upstream
+    ProductIdentification (scanner.product_id.identify_product) -- it is
+    NOT related to the Trader's own accept/reject verdict on the deal
+    below. Bug fix (Phase 4B.5): this used to be hardcoded True on the
+    fallback path and derived from `not verdict["reject_valuation"]` on the
+    adjusted path, which conflated "does the Trader like this deal" with
+    "was the product correctly identified" -- two unrelated questions --
+    and made valuation confidence swing with the Trader's opinion of deal
+    quality instead of staying tied to product-ID confidence. It must stay
+    independent of reject_valuation.
     """
     fallback_valuation = build_valuation_from_evidence(
-        evidence, model_identified_confidently=True
+        evidence, model_identified_confidently=model_identified_confidently
     )
     fallback_verdict = {
         "reject_valuation": False,
@@ -129,9 +141,11 @@ def trader_review(
     kept_evidence = [e for i, e in enumerate(evidence) if i not in weak_indices]
 
     # Deterministic Python recompute with the trader-flagged weak evidence
-    # excluded -- the trader never sets the number itself.
+    # excluded -- the trader never sets the number itself. Product-ID
+    # confidence is passed through unchanged here too (see docstring above
+    # -- it must not be derived from verdict["reject_valuation"]).
     adjusted_valuation = build_valuation_from_evidence(
-        kept_evidence, model_identified_confidently=not verdict.get("reject_valuation", False)
+        kept_evidence, model_identified_confidently=model_identified_confidently
     )
     if verdict.get("reject_valuation") and not kept_evidence:
         adjusted_valuation.evidence_note = (

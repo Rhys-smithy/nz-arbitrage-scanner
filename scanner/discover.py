@@ -12,10 +12,12 @@ it has its own freshness store (scanner/discovery_store.py).
 """
 from __future__ import annotations
 
-from datetime import date
+from collections import Counter
+from datetime import date, datetime, timezone
 
 from scanner.bundle import value_bundle
 from scanner.comparable_research import extract_price, research_comparables
+from scanner.discovery_report import update_discovery_index, write_discovery_report
 from scanner.discovery_store import load_discovered, record_sightings, save_discovered
 from scanner.evidence import classify_evidence
 from scanner.flip_score import score_and_decide
@@ -26,6 +28,8 @@ from scanner.notifier import build_flip_alert, send_telegram_message
 from scanner.product_id import detect_condition_risk, identify_product
 from scanner.query_generator import allocate_discovery_queries
 from scanner.researcher import research
+from scanner.scrapers.turners_vehicles import DIVISIONS as _TURNERS_VEHICLE_DIVISIONS
+from scanner.search.auction_search import AuctionSearchSource
 from scanner.search.util import canonicalize_url, identify_marketplace, is_individual_listing_url
 from scanner.search.web_search import WebSearchSource
 from scanner.search_stats import (
@@ -42,11 +46,23 @@ from scanner.valuation import apply_valuation
 # pipeline stage, but must never surface as a buyable opportunity). These
 # are the domains this repo already treats as real marketplaces with a
 # working individual-listing pattern in search/util.py.
+#
+# Thorntons/Mainland Auctions were removed from this list (source audit,
+# 2026-08-16): both are confirmed JS-only bidding platforms that even
+# Google can't index (see README.md), so Tavily-style search discovery
+# has never found real per-lot candidates there in practice, and
+# scanner/listing_verification.py has always marked anything from either
+# source "unsupported" -- zero conversion, forever. Keeping them in the
+# domain filter only diluted Tavily's per-query result budget away from
+# domains that can actually produce a candidate. Removing them is a
+# config-shaped change only: the sources themselves are untouched, still
+# fully supported by the legacy scan pipeline (config.json's separate
+# `sites` toggle), and still handled correctly by verify_listing() /
+# discover.py's WATCH-preservation path below if a candidate from either
+# ever does turn up some other way.
 DEFAULT_DISCOVERY_DOMAINS = [
     "trademe.co.nz",
     "turners.co.nz",
-    "thorntons.net.nz",
-    "mainlandauctions.nz",
 ]
 
 _EBAY_DOMAINS = {"ebay.com", "www.ebay.com", "ebay.com.au", "www.ebay.com.au"}
@@ -116,6 +132,191 @@ def _process_query_results(
     return entry, unique_results
 
 
+_CANDIDATE_GROUP_ORDER = ["turners_general_goods", "turners_vehicles", "other"]
+
+# Business-priority order for the paid-research allocation only (see
+# _select_research_candidates() below) -- has no effect on discovery,
+# candidate counting, verification, or the WATCH-preservation path, all of
+# which still see every candidate exactly as before.
+#
+# Run #40 live validation (2026-08-17): the $500->$10k strategy targets
+# small/medium, high-value-density physical goods (electronics, tools,
+# collectables, hobby items, etc. -- everything Turners' General Goods
+# catalog covers) and has explicitly asked to deprioritise cars,
+# motorcycles, heavy/agricultural machinery, and trailers/caravans (i.e.
+# every turners_vehicles candidate -- see turners_vehicles.VEHICLE_
+# CATEGORIES) for the *paid* research budget specifically: that run spent
+# 2 of 5 research slots (40%) on a motorbike and a farm bike under the old
+# round-robin allocation. turners_general_goods now gets first claim on
+# every max_research_items slot; turners_vehicles only receives a slot
+# once every general-goods candidate that wants one this run has already
+# been served. Vehicles are not excluded -- a run with fewer general-goods
+# candidates than the budget still lets vehicles fill the leftover slots
+# (see test_vehicles_receive_overflow_slots_when_general_goods_pool_
+# exhausted in tests/test_discover.py), and every vehicle candidate is
+# still found, counted in candidates_found, and logged exactly as before
+# -- this constant only decides who wins a scarce research slot.
+_RESEARCH_PRIORITY_ORDER = ["turners_general_goods", "turners_vehicles"]
+
+
+def _candidate_group(result) -> str:
+    """Classifies a candidate for FAIR SLOT ALLOCATION only, not for
+    verification -- listing_verification.py has its own, stricter URL
+    matching for that. Turners General Goods and the four vehicle divisions
+    are the only two individual-listing URL shapes turners.co.nz has (see
+    scanner/scrapers/turners_catalog.py and turners_vehicles.py), so "on
+    turners.co.nz, not under /General-Goods/" is a reliable proxy for
+    "vehicle division listing" among is_individual_listing_url() survivors,
+    without duplicating turners_vehicles.DIVISIONS' path table here.
+    """
+    if "turners.co.nz" not in result.url:
+        return "other"
+    if "/General-Goods/" in result.url:
+        return "turners_general_goods"
+    return "turners_vehicles"
+
+
+def _acquisition_evidence_tier(result) -> int:
+    """Lower = stronger evidence that `result.price` reflects something
+    close to a realistic acquisition price, using only already-observed
+    auction state from scanner/scrapers/turners_catalog.py /
+    turners_vehicles.py (scanner/search/auction_search.py carries it
+    through onto SearchResult) -- never an invented or estimated number.
+
+    0: a real, fixed, immediately-payable price (buy_now).
+    1: active bidding AND the seller's reserve is confirmed met -- current
+       price is close to a real transaction price.
+    2: active bidding, reserve state unknown/not yet met/no reserve field
+       at all (every Turners Vehicle candidate is here -- that division's
+       pages never expose reserve_status) -- still more informative than
+       an untouched listing.
+    3: no bids placed yet (`starting_bid`), or auction state is unknown
+       entirely (non-Turners sources, where price_type is always None) --
+       the weakest usable evidence, but not excluded outright.
+    4: no price at all.
+    """
+    if result.price is None:
+        return 4
+    if result.buy_now_price is not None:
+        return 0
+    if result.price_type == "current_bid" and result.reserve_status == "Reserve Met":
+        return 1
+    if result.price_type == "current_bid":
+        return 2
+    return 3
+
+
+def _select_research_candidates(candidates: list, max_research: int, prefer_below: float) -> list:
+    """Replaces a single global cheapest-first sort+slice (pre Run #35 live
+    validation, that logic just did `candidates.sort(key=lambda r: (r.price
+    is None, r.price > prefer_below, r.price)); candidates[:max_research]`).
+
+    That let a large pool of $1 starting-bid General Goods listings consume
+    the entire max_research_items budget and permanently locked out
+    Vehicles -- confirmed in Run #35 (131 raw General Goods vs 80 raw
+    Vehicle candidates; General Goods, scraped first per config.json's
+    turners_categories order, won every $1 tie via Python's stable sort,
+    and all 5 research slots went to General Goods).
+
+    Two independent pieces:
+
+    1. Within each source group, order by (acquisition evidence tier,
+       over-budget, price) -- see _acquisition_evidence_tier(). The
+       existing `prefer_purchase_price_below` concept is retained exactly
+       as before, just demoted beneath the new evidence tier so a
+       real-bid/buy-now candidate no longer loses to a cheaper but
+       unevidenced $1 starting bid.
+    2. Across groups, fill by strict business-priority order
+       (_RESEARCH_PRIORITY_ORDER: Turners General Goods before Turners
+       Vehicles) rather than round robin -- see _RESEARCH_PRIORITY_ORDER's
+       comment for the Run #40 rationale. General Goods claims every slot
+       it can fill first; Vehicles only receives the leftover slots once
+       General Goods' pool for this run is exhausted, so Vehicles are
+       deprioritised, not excluded -- a run without enough General Goods
+       candidates to fill the budget still lets Vehicles use the rest.
+       (Prior to this, an earlier fix used one-slot-per-group round robin
+       purely to stop General Goods from starving Vehicles to zero by
+       outnumbering it; that protection is superseded by the Run #40
+       business decision to deprioritise Vehicles deliberately.)
+
+    Deterministic and side-effect-free: same input always produces the
+    same output, no randomness, no estimated/invented prices.
+    """
+    def sort_key(r):
+        return (
+            _acquisition_evidence_tier(r),
+            r.price is not None and r.price > prefer_below,
+            r.price if r.price is not None else float("inf"),
+        )
+
+    groups: dict = {name: [] for name in _CANDIDATE_GROUP_ORDER}
+    for r in candidates:
+        groups[_candidate_group(r)].append(r)
+    for name in groups:
+        groups[name].sort(key=sort_key)
+
+    selected: list = []
+    for name in _RESEARCH_PRIORITY_ORDER:
+        if len(selected) >= max_research:
+            break
+        remaining = max_research - len(selected)
+        selected.extend(groups[name][:remaining])
+    return selected
+
+
+def _build_unverified_watch_opportunity(candidate, verified) -> Opportunity:
+    """Phase 4B.3: preserves a discovery candidate whose source
+    listing_verification.verify_listing() reports as "unsupported" (e.g.
+    Trade Me, Thorntons, Mainland Auctions -- a compliant re-fetch is
+    structurally impossible for these, see that module's docstring) as a
+    clearly labelled WATCH opportunity, instead of the previous behaviour
+    of discarding it identically to a genuinely "unavailable" candidate.
+
+    Deliberately does NOT call identify_product/research_comparables/
+    apply_valuation/score_and_decide -- running the paid AI/valuation
+    pipeline on a price that was never independently confirmed would
+    present false precision on evidence Phase 4B.1 already established
+    isn't trustworthy alone (Tavily search-snippet text), and burns AI
+    budget on a candidate this function can already tell isn't going to
+    reach BUY. Only what discovery itself already observed is carried
+    through -- title/url/source/price/price_type/buy_now_price/
+    reserve_status/closing_date/starts_on, exactly as scraped -- nothing
+    here is invented, and every valuation/scoring field (flip_score,
+    max_buy_price, expected profit/ROI, etc.) is left at its dataclass
+    default (None/"unknown") rather than fabricated.
+
+    decision is hardcoded "WATCH" and verification_status="unsupported"
+    -- this candidate can never reach "BUY" or "PROFITABLE BUT CAPITAL
+    RISK" through this path, by construction, not by downstream filtering.
+    """
+    reasons = [
+        f"Verification unsupported: {verified.reason}",
+        "Price and evidence are UNVERIFIED (from search-result text only, "
+        "not re-fetched from the listing itself) -- open the listing and "
+        "confirm price, condition, and availability manually before any "
+        "purchase decision.",
+    ]
+    if candidate.description:
+        reasons.append(f"Search snippet: {candidate.description}")
+    if candidate.location:
+        reasons.append(f"Location (from search result, unverified): {candidate.location}")
+
+    return Opportunity(
+        title=candidate.title,
+        url=candidate.url,
+        source=identify_marketplace(candidate.url),
+        current_price=candidate.price,
+        price_type=candidate.price_type,
+        buy_now_price=candidate.buy_now_price,
+        reserve_status=candidate.reserve_status,
+        closing_date=candidate.closing_date,
+        starts_on=candidate.starts_on,
+        verification_status="unsupported",
+        decision="WATCH",
+        decision_reasons=reasons,
+    )
+
+
 def run_discovery(config: dict) -> list[Opportunity]:
     discovery_cfg = config.get("discovery", {})
     if not discovery_cfg.get("enabled", False):
@@ -123,12 +324,19 @@ def run_discovery(config: dict) -> list[Opportunity]:
               "Set it to true (and configure a web search provider) to run this mode.")
         return []
 
+    # Tavily/web-search unavailability must only skip the Tavily-side path
+    # below -- it must NOT exit run_discovery() early. AuctionSearchSource
+    # (Turners direct-scrape discovery, see below) has its own working
+    # scrapers and doesn't depend on a web search provider at all; the old
+    # hard `return []` here predates AuctionSearchSource being wired into
+    # this function and was only ever correct back when Tavily was the sole
+    # candidate source discover.py had.
     web_search = WebSearchSource()
     if not web_search.available:
         print("[discover] No web search provider configured (set WEB_SEARCH_PROVIDER + "
               "its API key env var, e.g. WEB_SEARCH_PROVIDER=tavily + TAVILY_API_KEY). "
-              "Nothing to discover -- exiting rather than fabricating results.")
-        return []
+              "Tavily-based web search discovery will be skipped this run -- continuing "
+              "with Turners direct-scrape discovery (AuctionSearchSource) only.")
 
     max_queries = discovery_cfg.get("max_queries_per_run", 15)
     max_results = discovery_cfg.get("max_results_per_query", 8)
@@ -159,22 +367,75 @@ def run_discovery(config: dict) -> list[Opportunity]:
     discovery_domains = discovery_cfg.get("include_domains") or DEFAULT_DISCOVERY_DOMAINS
     discovery_domains = [d for d in discovery_domains if d.lower() not in _EBAY_DOMAINS]
 
-    queries = allocate_discovery_queries(
-        products=products,
-        concepts=concepts,
-        max_queries=max_queries,
-        bare_product_min_ratio=bare_product_min_ratio,
-        seed=rotation_seed,
-    )
-
-    print(f"[discover] running {len(queries)} discovery quer{'y' if len(queries)==1 else 'ies'} "
-          f"across {len(products)} product(s), restricted to domains: {', '.join(discovery_domains)}")
+    if web_search.available:
+        queries = allocate_discovery_queries(
+            products=products,
+            concepts=concepts,
+            max_queries=max_queries,
+            bare_product_min_ratio=bare_product_min_ratio,
+            seed=rotation_seed,
+        )
+        print(f"[discover] running {len(queries)} discovery quer{'y' if len(queries)==1 else 'ies'} "
+              f"across {len(products)} product(s), restricted to domains: {', '.join(discovery_domains)}")
+    else:
+        # Nothing to allocate a Tavily query budget for -- Turners discovery
+        # below doesn't use `queries` at all.
+        queries = []
 
     stats = load_stats()
     discovered_store = load_discovered()
     all_results = []
     deduped = []
     seen_canonical: set = set()
+
+    # Turners (General Goods + Vehicles) already has working scrapers that
+    # reach real inventory directly, unlike Tavily web search, which rarely
+    # surfaces individual Turners listings (see Runs #28-30). Processed FIRST
+    # so its canonical URLs populate seen_canonical before the Tavily loop
+    # below -- if the same listing also comes back from Tavily, the Turners
+    # copy (already carrying a real scraped price) wins the duplicate, and
+    # the Tavily copy is dropped as `rejected_duplicate`. Reuses the same
+    # _process_query_results()/candidates/verification/valuation pipeline as
+    # every other source -- no special-casing downstream of this point.
+    #
+    # discovery.include_vehicles (default True if absent, for backwards
+    # compatibility) gates ONLY this discover-mode call -- it filters the
+    # turners_categories list passed to AuctionSearchSource so the four
+    # Turners vehicle divisions (see turners_vehicles.DIVISIONS) are never
+    # scraped here when False. Scan mode (main.py) fetches Turners General
+    # Goods/Vehicles via its own separate call path and is untouched by
+    # this flag.
+    include_vehicles = config.get("discovery", {}).get("include_vehicles", True)
+    turners_categories = config.get("turners_categories", [])
+    if not include_vehicles:
+        turners_categories = [c for c in turners_categories if c not in _TURNERS_VEHICLE_DIVISIONS]
+    auction_source = AuctionSearchSource(config)
+    try:
+        auction_results = auction_source.search(turners_categories=turners_categories)
+    except Exception as e:
+        # AuctionSearchSource already swallows its own scraper-level
+        # failures (see scanner/search/auction_search.py) -- this is a
+        # last-resort guard so an unexpected failure here can never take
+        # down the Tavily loop below it in the same run.
+        print(f"[discover]   auction source failed unexpectedly: {e}")
+        auction_results = []
+    for r in auction_results:
+        r._discovery_concept = None  # not part of Tavily's concept-rotation stats
+    all_results.extend(auction_results)
+    auction_log_entry, auction_unique = _process_query_results(
+        "auction_source:turners", ["turners.co.nz", "thorntons.net.nz", "mainlandauctions.nz"],
+        auction_results, seen_canonical,
+    )
+    deduped.extend(auction_unique)
+    print(
+        f"[discover]   source=auction raw={auction_log_entry['raw_results']} "
+        f"unique={auction_log_entry['unique_results']} "
+        f"valid_listings={auction_log_entry['valid_individual_listings']} "
+        f"rejected(duplicate={auction_log_entry['rejected_duplicate']}, "
+        f"not_individual_listing={auction_log_entry['rejected_not_individual_listing']}, "
+        f"ebay={auction_log_entry['rejected_ebay']})"
+    )
+
     for query in queries:
         results = web_search.search(query, max_results=max_results, include_domains=discovery_domains)
         concept = extract_concept_from_query(query, concepts)
@@ -215,17 +476,43 @@ def run_discovery(config: dict) -> list[Opportunity]:
     # for any unrecognised domain rather than "unknown", so a naive
     # "!= unknown" check let almost everything through).
     candidates = [r for r in deduped if is_individual_listing_url(r.url)]
+    # Phase 4B.4: true funnel size -- every individual-listing candidate
+    # found this run, independent of max_research_items. Previously this
+    # variable was assigned AFTER the cap below, so "candidates_found" in
+    # run_meta was actually a post-cap count wearing a pre-cap name.
+    candidates_found = len(candidates)
 
-    # Cheapest-first, capped to bankroll preference, then to max_research_items --
-    # spec section 15: prioritise the $500 bankroll, avoid flooding with expensive items.
-    candidates.sort(
-        key=lambda r: (
-            r.price is None,                          # priced items first
-            r.price is not None and r.price > prefer_below,  # then within-budget items first
-            r.price or float("inf"),                  # then cheapest first
-        )
-    )
-    candidates = candidates[:max_research]
+    # Phase 4B.4: max_research_items only rations the paid AI-research
+    # pipeline (identify_product/research_comparables/research/
+    # trader_review, below) -- and only a Turners candidate can ever enter
+    # that pipeline: verify_listing() has no verifier for any other source
+    # and returns "unsupported" for all of them with zero HTTP/AI/Tavily
+    # cost (see scanner/listing_verification.py's _UNSUPPORTED_REASONS and
+    # its final unrecognised-source fallback). A Trade Me candidate winning
+    # one of the 5 round-robin slots therefore never saved any AI budget --
+    # it only ever cost a Turners candidate its shot at the real research
+    # pipeline, for no compensating saving. So: only Turners-group
+    # candidates compete for the capped slots below; every "other"-group
+    # candidate (Trade Me today, anything else verify_listing() can't
+    # verify tomorrow) bypasses the cap entirely and flows into the exact
+    # same verification loop as before -- today that always resolves to
+    # "unsupported" and is preserved as a free WATCH opportunity (see
+    # _build_unverified_watch_opportunity), just for however many such
+    # candidates discovery actually found, not capped at whatever's left
+    # over from Turners' round-robin share.
+    research_eligible = [r for r in candidates if _candidate_group(r) != "other"]
+    bypass_candidates = [r for r in candidates if _candidate_group(r) == "other"]
+
+    # See _select_research_candidates() docstring above for the full
+    # rationale (Run #35 live validation finding: cheapest-first alone let
+    # $1 General Goods starting bids consume the whole research budget).
+    # Only research_eligible (turners_general_goods/turners_vehicles) is
+    # passed in now, so _select_research_candidates()'s "other" bucket is
+    # always empty here and every max_research slot goes to Turners.
+    research_eligible = _select_research_candidates(research_eligible, max_research, prefer_below)
+    candidates_selected_for_research = len(research_eligible)
+
+    candidates = research_eligible + bypass_candidates
 
     # Phase 4B.1: a candidate's price (and everything downstream of it --
     # product ID, comparable research, valuation, Flip Score) must never be
@@ -238,21 +525,42 @@ def run_discovery(config: dict) -> list[Opportunity]:
     verification_cache = VerificationCache(user_agent, request_delay)
 
     verified_candidates = []
+    watch_unverified_opportunities: list[Opportunity] = []
     verification_dropped = 0
     for candidate in candidates:
         verified = verify_listing(candidate.url, verification_cache)
-        if verified.status != "verified":
-            verification_dropped += 1
+        if verified.status == "verified":
+            candidate.price = verified.price  # overwrite snippet-derived price with the authoritative one
+            verified_candidates.append(candidate)
+            continue
+        if verified.status == "unsupported":
+            # Phase 4B.3: structurally can't be compliantly re-verified
+            # (Trade Me/Thorntons/Mainland Auctions) -- preserved as a
+            # WATCH opportunity (see _build_unverified_watch_opportunity)
+            # instead of being dropped like a genuinely "unavailable"
+            # candidate below. Never joins `verified_candidates`, so it
+            # can never reach identify_product/valuation/score_and_decide.
+            watch_unverified_opportunities.append(
+                _build_unverified_watch_opportunity(candidate, verified)
+            )
             print(
-                f"[discover]   verification dropped: status={verified.status} "
+                f"[discover]   verification unsupported -> WATCH (unverified): "
                 f"url={candidate.url!r} reason={verified.reason!r}"
             )
             continue
-        candidate.price = verified.price  # overwrite snippet-derived price with the authoritative one
-        verified_candidates.append(candidate)
+        # status == "unavailable" (or anything else non-"verified"): the
+        # source was attempted but no authoritative price/data could be
+        # found (e.g. item not on page 1 of a Turners catalog) -- still
+        # dropped outright, unchanged from pre-4B.3 behaviour.
+        verification_dropped += 1
+        print(
+            f"[discover]   verification dropped: status={verified.status} "
+            f"url={candidate.url!r} reason={verified.reason!r}"
+        )
 
     print(
         f"[discover] verification: {len(verified_candidates)} verified, "
+        f"{len(watch_unverified_opportunities)} unsupported (preserved as WATCH), "
         f"{verification_dropped} dropped (of {len(candidates)} candidates)."
     )
     candidates = verified_candidates
@@ -285,6 +593,10 @@ def run_discovery(config: dict) -> list[Opportunity]:
             costs_excl_purchase=0,  # refined by apply_valuation below once costs are known
             bankroll=bankroll_cfg.get("starting_bankroll", 500),
             api_key=api_key,
+            # Phase 4B.5 bug fix: this must be the real product-identification
+            # confidence, not derived from the trader's own accept/reject
+            # verdict (see scanner/trader.py's trader_review docstring).
+            model_identified_confidently=identification.model_identified_confidently,
         )
 
         opportunity = Opportunity(
@@ -292,6 +604,20 @@ def run_discovery(config: dict) -> list[Opportunity]:
             url=candidate.url,
             source=identify_marketplace(candidate.url),
             current_price=candidate.price,
+            # Carried through from the pre-verification candidate -- a
+            # known, small limitation: if bidding activity happened in the
+            # brief window between initial scrape and verify_listing()'s
+            # re-fetch, this could be stale relative to the now-current
+            # verified price. Not worth widening listing_verification.py's
+            # scope to close (see scanner/listing_verification.py's own
+            # docstring on what it does and doesn't verify).
+            price_type=candidate.price_type,
+            # Phase 4B.2 follow-up (persistence port): same carried-through-
+            # from-pre-verification-candidate rationale as price_type above.
+            buy_now_price=candidate.buy_now_price,
+            reserve_status=candidate.reserve_status,
+            closing_date=candidate.closing_date,
+            starts_on=candidate.starts_on,
             identification=identification,
             valuation=valuation,
         )
@@ -308,7 +634,54 @@ def run_discovery(config: dict) -> list[Opportunity]:
 
     save_stats(stats)
 
+    # Phase 4B.3: append the preserved-but-unverified WATCH opportunities
+    # after the scored loop above, not into `candidates`/the loop itself --
+    # they were never meant to reach identify_product/valuation, and this
+    # keeps that guarantee structural rather than relying on every field
+    # on them happening to be falsy. flip_score is None for all of these,
+    # so the sort below (None -> 0) places them alongside/after PASS-band
+    # scored opportunities rather than displacing any real BUY/WATCH result.
+    opportunities.extend(watch_unverified_opportunities)
+
     opportunities.sort(key=lambda o: o.flip_score or 0, reverse=True)
+
+    # Phase 4B.2 (persistence port): persist every Opportunity from this run
+    # (BUY, WATCH, PASS, and PROFITABLE BUT CAPITAL RISK alike) plus the run
+    # metadata already computed above, so a durable, inspectable record
+    # exists that downstream UI/reporting (see scanner/deal_queue_report.py)
+    # can read without recomputing or inventing any valuation/scoring
+    # logic. Written even when opportunities is empty, since the run itself
+    # (queries/candidates/verification counts) is still worth recording for
+    # debugging. Ported manually from commit f75a4eb onto the current
+    # candidate-selection/evidence-tier pipeline -- see
+    # scanner/discovery_report.py, which this does not modify.
+    run_meta = {
+        "run_timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "mode": "discover",
+        "queries_run": len(queries),
+        "candidates_found": candidates_found,
+        # Phase 4B.4: the subset of candidates_found that competed for (and
+        # was capped by) max_research_items -- Turners-eligible candidates
+        # only. Unsupported-source candidates bypass this cap entirely (see
+        # research_eligible/bypass_candidates above), so this number can be
+        # smaller than candidates_verified + candidates_verification_*
+        # combined; it specifically answers "how much of the AI-research
+        # budget did this run use out of what was available".
+        "candidates_selected_for_research": candidates_selected_for_research,
+        "candidates_verified": len(verified_candidates),
+        # Phase 4B.3: split out from candidates_verification_dropped --
+        # these were preserved as WATCH opportunities (see
+        # watch_unverified_opportunities above), not discarded. Only
+        # genuinely "unavailable" candidates count as dropped now.
+        "candidates_verification_unsupported": len(watch_unverified_opportunities),
+        "candidates_verification_dropped": verification_dropped,
+        "opportunity_count": len(opportunities),
+        "decision_counts": dict(Counter(o.decision for o in opportunities)),
+    }
+    report_path, report_payload = write_discovery_report(opportunities, run_meta)
+    update_discovery_index(report_path, report_payload)
+    print(f"[discover] wrote {len(opportunities)} opportunit{'y' if len(opportunities) == 1 else 'ies'} to {report_path}")
+
     return opportunities
 
 
@@ -317,7 +690,18 @@ def print_top_opportunities(opportunities: list[Opportunity], limit: int = 10) -
     for i, o in enumerate(opportunities[:limit], 1):
         val = o.valuation
         print(f"{i}. {o.title}")
-        print(f"Current: ${o.current_price:.0f}" if o.current_price is not None else "Current: unknown")
+        if o.current_price is not None:
+            current_line = f"Current: ${o.current_price:.0f}"
+            if o.price_type == "starting_bid":
+                # Preserve the observed bid (still printed, unchanged) but
+                # make it unmistakable that it is not a confirmed
+                # acquisition price -- see valuation.py's
+                # compute_profit_and_roi() for why expected profit/ROI
+                # are absent below for exactly this case.
+                current_line += " (starting bid, no bids yet -- not a confirmed price)"
+            print(current_line)
+        else:
+            print("Current: unknown")
         if val.quick_sale_low is not None:
             print(f"Quick resale: ${val.quick_sale_low:.0f}-{val.quick_sale_high:.0f}")
         if o.expected_net_profit_low is not None:
@@ -325,6 +709,10 @@ def print_top_opportunities(opportunities: list[Opportunity], limit: int = 10) -
                   + (f"-{o.expected_net_profit_high:.0f}" if o.expected_net_profit_high else ""))
         if o.roi_low_pct is not None:
             print(f"ROI: {o.roi_low_pct:.0f}%" + (f"-{o.roi_high_pct:.0f}%" if o.roi_high_pct else ""))
+        if o.price_type == "starting_bid" and o.expected_net_profit_low is None:
+            print("Profit/ROI: not computed -- auction hasn't been bid on yet, so the "
+                  "current price isn't a reliable cost basis. See Max buy for the "
+                  "actionable ceiling.")
         if o.max_buy_price is not None:
             print(f"Max buy: ${o.max_buy_price:.0f}")
         print(f"Score: {o.flip_score}")

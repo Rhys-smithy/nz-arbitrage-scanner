@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-08-17T18:38:10Z",
-  "count": 16,
+  "count": 23,
   "reports": [
     {
       "csv": "opportunities_20260817_1837.csv",
@@ -9,10 +9,52 @@
       "rows": 15
     },
     {
+      "csv": "opportunities_20260817_1044.csv",
+      "xlsx": "opportunities_20260817_1044.xlsx",
+      "timestamp": "2026-08-17T10:44",
+      "rows": 11
+    },
+    {
+      "csv": "opportunities_20260817_0821.csv",
+      "xlsx": "opportunities_20260817_0821.xlsx",
+      "timestamp": "2026-08-17T08:21",
+      "rows": 14
+    },
+    {
+      "csv": "opportunities_20260817_0305.csv",
+      "xlsx": "opportunities_20260817_0305.xlsx",
+      "timestamp": "2026-08-17T03:05",
+      "rows": 11
+    },
+    {
       "csv": "opportunities_20260816_1826.csv",
       "xlsx": "opportunities_20260816_1826.xlsx",
       "timestamp": "2026-08-16T18:26",
       "rows": 11
+    },
+    {
+      "csv": "opportunities_20260816_1056.csv",
+      "xlsx": "opportunities_20260816_1056.xlsx",
+      "timestamp": "2026-08-16T10:56",
+      "rows": 8
+    },
+    {
+      "csv": "opportunities_20260816_1007.csv",
+      "xlsx": "opportunities_20260816_1007.xlsx",
+      "timestamp": "2026-08-16T10:07",
+      "rows": 11
+    },
+    {
+      "csv": "opportunities_20260816_0649.csv",
+      "xlsx": "opportunities_20260816_0649.xlsx",
+      "timestamp": "2026-08-16T06:49",
+      "rows": 25
+    },
+    {
+      "csv": "opportunities_20260816_0520.csv",
+      "xlsx": "opportunities_20260816_0520.xlsx",
+      "timestamp": "2026-08-16T05:20",
+      "rows": 25
     },
     {
       "csv": "opportunities_20260815_1826.csv",

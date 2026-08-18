@@ -5,12 +5,44 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import unittest
 from unittest import mock
 
-from scanner.discover import DEFAULT_DISCOVERY_DOMAINS, _process_query_results, run_discovery
+from scanner.discover import (
+    DEFAULT_DISCOVERY_DOMAINS,
+    _acquisition_evidence_tier,
+    _candidate_group,
+    _process_query_results,
+    _select_research_candidates,
+    run_discovery,
+)
 from scanner.search.base import SearchResult
+from scanner.models import ComparableEvidence, ProductIdentification, ResaleValuation
 
 
 def _result(url, title="Item", price=None):
     return SearchResult(title=title, url=url, price=price, currency="NZD", source="web_search:tavily")
+
+
+def _auction_result(
+    url,
+    title="Item",
+    price=None,
+    price_type=None,
+    buy_now_price=None,
+    reserve_status=None,
+):
+    """Same idea as _result() but for Turners candidates carrying the
+    Phase 4B follow-up auction-state fields (price_type/buy_now_price/
+    reserve_status) that _select_research_candidates() and
+    valuation.compute_profit_and_roi() now read."""
+    return SearchResult(
+        title=title,
+        url=url,
+        price=price,
+        currency="NZD",
+        source="Turners",
+        price_type=price_type,
+        buy_now_price=buy_now_price,
+        reserve_status=reserve_status,
+    )
 
 
 class TestDefaultDiscoveryDomains(unittest.TestCase):
@@ -21,8 +53,19 @@ class TestDefaultDiscoveryDomains(unittest.TestCase):
     def test_default_domains_are_the_known_nz_marketplaces(self):
         self.assertEqual(
             set(DEFAULT_DISCOVERY_DOMAINS),
-            {"trademe.co.nz", "turners.co.nz", "thorntons.net.nz", "mainlandauctions.nz"},
+            {"trademe.co.nz", "turners.co.nz"},
         )
+
+    def test_thorntons_and_mainland_excluded_from_default_domains(self):
+        # Source audit (2026-08-16): both are confirmed JS-only bidding
+        # platforms with zero real conversion through Tavily-style search
+        # discovery -- see DEFAULT_DISCOVERY_DOMAINS's docstring in
+        # scanner/discover.py. Removing them frees Tavily's per-query
+        # result budget for domains that can actually produce a candidate.
+        # (They remain fully supported by the legacy scan pipeline via
+        # config.json's separate `sites` toggle -- untouched by this.)
+        for domain in ("thorntons.net.nz", "mainlandauctions.nz"):
+            self.assertNotIn(domain, DEFAULT_DISCOVERY_DOMAINS)
 
 
 class TestProcessQueryResults(unittest.TestCase):
@@ -98,6 +141,209 @@ class TestProcessQueryResults(unittest.TestCase):
         self.assertEqual(len(unique_results2), 1)
 
 
+class TestAcquisitionEvidenceTier(unittest.TestCase):
+    """Phase 4B follow-up (Run #35 live validation): lower tier = stronger
+    evidence that `price` reflects something close to a realistic
+    acquisition price. Every case here is driven only by already-scraped
+    fields -- no estimated/invented data anywhere in this function."""
+
+    def test_no_price_is_worst_tier(self):
+        r = _auction_result("https://www.turners.co.nz/x/1", price=None)
+        self.assertEqual(_acquisition_evidence_tier(r), 4)
+
+    def test_buy_now_is_best_tier_regardless_of_other_fields(self):
+        r = _auction_result(
+            "https://www.turners.co.nz/x/1", price=17400.0, buy_now_price=17400.0, price_type=None
+        )
+        self.assertEqual(_acquisition_evidence_tier(r), 0)
+
+    def test_current_bid_with_reserve_met_is_tier_one(self):
+        r = _auction_result(
+            "https://www.turners.co.nz/x/1", price=120.0, price_type="current_bid",
+            reserve_status="Reserve Met",
+        )
+        self.assertEqual(_acquisition_evidence_tier(r), 1)
+
+    def test_current_bid_without_confirmed_reserve_is_tier_two(self):
+        # Covers both "reserve_status is None" (e.g. every Turners Vehicle
+        # candidate -- that division never scrapes reserve_status) and
+        # "Reserve Not Met" -- neither confirms the reserve is cleared, but
+        # real bidding has still happened, which is still more informative
+        # than an untouched $1 listing.
+        r1 = _auction_result("https://www.turners.co.nz/x/1", price=5500.0, price_type="current_bid")
+        r2 = _auction_result(
+            "https://www.turners.co.nz/x/2", price=50.0, price_type="current_bid",
+            reserve_status="Reserve Not Met",
+        )
+        self.assertEqual(_acquisition_evidence_tier(r1), 2)
+        self.assertEqual(_acquisition_evidence_tier(r2), 2)
+
+    def test_starting_bid_is_tier_three(self):
+        r = _auction_result(
+            "https://www.turners.co.nz/x/1", price=1.0, price_type="starting_bid",
+            reserve_status="No Reserve",
+        )
+        self.assertEqual(_acquisition_evidence_tier(r), 3)
+
+    def test_unknown_auction_state_is_also_tier_three_not_excluded(self):
+        # A priced Tavily result (price_type always None for non-Turners
+        # sources) must not be excluded outright -- it just ranks alongside
+        # starting-bid candidates rather than being treated as evidenced.
+        r = _result("https://www.trademe.co.nz/a/marketplace/listing/1", price=250.0)
+        self.assertEqual(_acquisition_evidence_tier(r), 3)
+
+
+class TestCandidateGroup(unittest.TestCase):
+    """Phase 4B follow-up: classifies a candidate for FAIR SLOT ALLOCATION
+    only (see _select_research_candidates), not for verification."""
+
+    def test_general_goods_url_groups_as_general_goods(self):
+        r = _auction_result(
+            "https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/28374370/"
+        )
+        self.assertEqual(_candidate_group(r), "turners_general_goods")
+
+    def test_vehicle_division_url_groups_as_vehicles(self):
+        for url in [
+            "https://www.turners.co.nz/Cars/Used-Cars-for-Sale/123456/",
+            "https://www.turners.co.nz/Trucks-Machinery/Used-Trucks-and-Machinery-for-Sale/654321/",
+            "https://www.turners.co.nz/motorcycles-scooters/Used-Motorbikes-for-Sale/111222/",
+            "https://www.turners.co.nz/buses-caravans/Used-Caravans-and-Motorhomes-for-Sale/333444/",
+        ]:
+            with self.subTest(url=url):
+                self.assertEqual(_candidate_group(_auction_result(url)), "turners_vehicles")
+
+    def test_non_turners_url_groups_as_other(self):
+        r = _result("https://www.trademe.co.nz/a/marketplace/listing/999")
+        self.assertEqual(_candidate_group(r), "other")
+
+
+class TestSelectResearchCandidates(unittest.TestCase):
+    """Phase 4B follow-up + Run #40 business-priority change: strict
+    General-Goods-before-Vehicles tier fill (replacing the earlier round
+    robin) layered on top of the within-group evidence-tier/price sort.
+    See _select_research_candidates() docstring in scanner/discover.py and
+    _RESEARCH_PRIORITY_ORDER's comment for the full rationale."""
+
+    def _gg(self, n, price=1.0, price_type="starting_bid", reserve_status=None):
+        return [
+            _auction_result(
+                f"https://www.turners.co.nz/General-Goods/Search/electronics/cameras/{i}/",
+                title=f"GG item {i}", price=price, price_type=price_type, reserve_status=reserve_status,
+            )
+            for i in range(n)
+        ]
+
+    def _vehicles(self, n, price=1.0, price_type="current_bid"):
+        return [
+            _auction_result(
+                f"https://www.turners.co.nz/Cars/Used-Cars-for-Sale/{200000 + i}/",
+                title=f"Vehicle {i}", price=price, price_type=price_type,
+            )
+            for i in range(n)
+        ]
+
+    def test_high_priority_general_goods_takes_all_slots_over_vehicles(self):
+        # Run #40 business-priority change (supersedes the old Run #35
+        # anti-starvation round robin, which is exactly what this test
+        # replaces): when General Goods has enough viable candidates to
+        # fill the entire research budget on its own, Vehicles must get
+        # ZERO slots -- the $500->$10k strategy has explicitly asked that
+        # cars/motorcycles/heavy machinery not consume scarce paid-research
+        # capacity while higher-priority small/medium goods are available.
+        candidates = self._gg(40) + self._vehicles(3)
+        selected = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+
+        groups = {_candidate_group(r) for r in selected}
+        self.assertNotIn("turners_vehicles", groups)
+        self.assertEqual(len(selected), 5)
+        self.assertTrue(all(_candidate_group(r) == "turners_general_goods" for r in selected))
+
+    def test_vehicles_receive_overflow_slots_when_general_goods_pool_exhausted(self):
+        # Vehicles are deprioritised, not excluded: discovery still finds
+        # and persists them (see _RESEARCH_PRIORITY_ORDER's comment), and
+        # if General Goods can't fill the whole budget on its own this run,
+        # the leftover slots roll over to Vehicles rather than going unused.
+        candidates = self._gg(2) + self._vehicles(5)
+        selected = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+
+        self.assertEqual(len(selected), 5)
+        gg_count = sum(1 for r in selected if _candidate_group(r) == "turners_general_goods")
+        vehicle_count = sum(1 for r in selected if _candidate_group(r) == "turners_vehicles")
+        self.assertEqual(gg_count, 2)   # both available GG candidates used
+        self.assertEqual(vehicle_count, 3)  # remaining 3 slots roll over to Vehicles
+
+    def test_vehicle_tier_internal_ordering_unchanged_by_priority_change(self):
+        # Requirement 3: within a single tier (here, Vehicles alone, no
+        # General Goods candidates competing at all), the existing
+        # evidence-tier/price sort_key ordering must be untouched by the
+        # priority-order change -- a real-bid vehicle still beats a
+        # cheaper, unevidenced one, exactly as it would within General
+        # Goods (see test_evidence_tier_beats_cheaper_but_unevidenced_
+        # candidate_within_a_group above).
+        cheap_unevidenced = _auction_result(
+            "https://www.turners.co.nz/Cars/Used-Cars-for-Sale/1/",
+            title="Cheap unevidenced vehicle", price=1.0, price_type="starting_bid",
+        )
+        real_bid = _auction_result(
+            "https://www.turners.co.nz/Cars/Used-Cars-for-Sale/2/",
+            title="Real bidding vehicle", price=500.0, price_type="current_bid", reserve_status="Reserve Met",
+        )
+        selected = _select_research_candidates(
+            [cheap_unevidenced, real_bid], max_research=1, prefer_below=250
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].title, "Real bidding vehicle")
+
+    def test_evidence_tier_beats_cheaper_but_unevidenced_candidate_within_a_group(self):
+        cheap_starting_bid = _auction_result(
+            "https://www.turners.co.nz/General-Goods/Search/electronics/x/1/",
+            title="Cheap unevidenced", price=1.0, price_type="starting_bid",
+        )
+        pricier_real_bid = _auction_result(
+            "https://www.turners.co.nz/General-Goods/Search/electronics/x/2/",
+            title="Real bidding", price=120.0, price_type="current_bid", reserve_status="Reserve Met",
+        )
+        selected = _select_research_candidates(
+            [cheap_starting_bid, pricier_real_bid], max_research=1, prefer_below=250
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].title, "Real bidding")
+
+    def test_prefer_purchase_price_below_still_breaks_ties_within_a_tier(self):
+        over_budget = _auction_result(
+            "https://www.turners.co.nz/General-Goods/Search/electronics/x/1/",
+            title="Over budget", price=400.0, price_type="current_bid", reserve_status="Reserve Met",
+        )
+        within_budget = _auction_result(
+            "https://www.turners.co.nz/General-Goods/Search/electronics/x/2/",
+            title="Within budget", price=200.0, price_type="current_bid", reserve_status="Reserve Met",
+        )
+        selected = _select_research_candidates(
+            [over_budget, within_budget], max_research=1, prefer_below=250
+        )
+
+        self.assertEqual(selected[0].title, "Within budget")
+
+    def test_does_not_exceed_max_research_items(self):
+        candidates = self._gg(10) + self._vehicles(10)
+        selected = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+        self.assertEqual(len(selected), 5)
+
+    def test_deterministic_across_repeated_calls(self):
+        candidates = self._gg(12) + self._vehicles(5)
+        first = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+        second = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+        self.assertEqual([r.url for r in first], [r.url for r in second])
+
+    def test_fewer_candidates_than_budget_returns_all_of_them(self):
+        candidates = self._gg(2) + self._vehicles(1)
+        selected = _select_research_candidates(candidates, max_research=5, prefer_below=250)
+        self.assertEqual(len(selected), 3)
+
+
 class _RunDiscoveryTestBase(unittest.TestCase):
     """Shared setup mocking out everything downstream of the search loop
     (product ID, comparable research, valuation) -- these tests only care
@@ -127,14 +373,31 @@ class _RunDiscoveryTestBase(unittest.TestCase):
             mock.patch("scanner.discover.save_discovered"),
             mock.patch("scanner.discover.load_discovered", return_value={}),
             mock.patch("scanner.discover.WebSearchSource"),
+            mock.patch("scanner.discover.AuctionSearchSource"),
+            # Phase 4B.2 follow-up (persistence port): these tests exercise
+            # run_discovery() end-to-end and must not write real files to
+            # the actual reports/ directory as a side effect -- persistence
+            # itself is covered separately and thoroughly by
+            # tests/test_discovery_report.py. Appended at the end (not
+            # inserted earlier in the list) so the existing self.mocks[4]/
+            # [5] index references below are unaffected.
+            mock.patch(
+                "scanner.discover.write_discovery_report",
+                return_value=("reports/discovery_test.json", {}),
+            ),
+            mock.patch("scanner.discover.update_discovery_index"),
         ]
         self.mocks = [p.start() for p in patches]
         for p in patches:
             self.addCleanup(p.stop)
-        self.mock_source_cls = self.mocks[-1]
+        self.mock_source_cls = self.mocks[4]
         self.mock_source = self.mock_source_cls.return_value
         self.mock_source.available = True
         self.mock_source.search.return_value = []  # no results -> no candidates reach valuation
+
+        self.mock_auction_source_cls = self.mocks[5]
+        self.mock_auction_source = self.mock_auction_source_cls.return_value
+        self.mock_auction_source.search.return_value = []  # no Turners results by default
 
 
 class TestRunDiscoveryUsesIncludeDomains(_RunDiscoveryTestBase):
@@ -215,16 +478,115 @@ class TestRunDiscoveryVerificationGate(_RunDiscoveryTestBase):
         mock_research.assert_not_called()
 
     def test_unsupported_candidate_never_reaches_identify_product(self):
+        # Phase 4B.3: "unsupported" is no longer dropped -- it's preserved
+        # as exactly one WATCH opportunity -- but must still never reach
+        # the AI/valuation pipeline (identify_product/research_comparables).
         with mock.patch("scanner.discover.verify_listing") as mock_verify:
             with mock.patch("scanner.discover.identify_product") as mock_identify:
-                mock_verify.return_value = mock.Mock(status="unsupported", price=None, reason="robots.txt disallows")
+                with mock.patch("scanner.discover.research_comparables") as mock_research:
+                    mock_verify.return_value = mock.Mock(
+                        status="unsupported", price=None, reason="robots.txt disallows"
+                    )
+                    opportunities = run_discovery(self._config())
+
+        mock_identify.assert_not_called()
+        mock_research.assert_not_called()
+        self.assertEqual(len(opportunities), 1)
+
+    def test_unsupported_candidate_becomes_a_clearly_labelled_watch_opportunity(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product"):
+                mock_verify.return_value = mock.Mock(
+                    status="unsupported", price=None,
+                    reason="Trade Me listing pages are disallowed by robots.txt",
+                )
                 opportunities = run_discovery(self._config())
 
-        self.assertEqual(opportunities, [])
-        mock_identify.assert_not_called()
+        self.assertEqual(len(opportunities), 1)
+        o = opportunities[0]
+        # Never treated as verified, never able to reach the BUY path.
+        self.assertEqual(o.verification_status, "unsupported")
+        self.assertEqual(o.decision, "WATCH")
+        self.assertNotIn(o.decision, ("BUY", "PROFITABLE BUT CAPITAL RISK"))
+        # URL/title preserved from the discovery candidate, not fabricated.
+        self.assertEqual(o.url, self.mock_source.search.return_value[0].url)
+        self.assertEqual(o.title, self.mock_source.search.return_value[0].title)
+        # The unsupported reason from verify_listing() is surfaced verbatim,
+        # plus an explicit manual-confirmation instruction.
+        self.assertTrue(any("robots.txt" in r for r in o.decision_reasons))
+        self.assertTrue(any("UNVERIFIED" in r and "confirm" in r.lower() for r in o.decision_reasons))
+        # No valuation/scoring work was done -- fields stay at their
+        # honest defaults, nothing invented.
+        self.assertIsNone(o.flip_score)
+        self.assertIsNone(o.max_buy_price)
+        self.assertIsNone(o.expected_net_profit_low)
+
+    def test_unsupported_candidate_preserves_snippet_price_marked_unverified(self):
+        # A search-snippet price that DOES exist must be preserved (not
+        # discarded, not treated as confirmed) -- this is the "available
+        # snippet/price evidence" the unsupported/WATCH tier exists to keep.
+        self.mock_source.search.return_value = [
+            _result(self.mock_source.search.return_value[0].url, title="Canon EOS", price=180.0),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product"):
+                mock_verify.return_value = mock.Mock(
+                    status="unsupported", price=None, reason="robots.txt disallows"
+                )
+                opportunities = run_discovery(self._config())
+
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0].current_price, 180.0)
+        self.assertEqual(opportunities[0].verification_status, "unsupported")
+
+    def test_unsupported_candidate_with_no_snippet_price_stays_none_not_fabricated(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product"):
+                mock_verify.return_value = mock.Mock(
+                    status="unsupported", price=None, reason="robots.txt disallows"
+                )
+                opportunities = run_discovery(self._config())
+
+        self.assertEqual(len(opportunities), 1)
+        self.assertIsNone(opportunities[0].current_price)
+
+    def test_unsupported_count_logged_separately_from_dropped(self):
+        import io
+        import contextlib
+
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product"):
+                mock_verify.return_value = mock.Mock(
+                    status="unsupported", price=None, reason="robots.txt disallows"
+                )
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    run_discovery(self._config())
+
+        output = buf.getvalue()
+        self.assertIn("1 unsupported (preserved as WATCH)", output)
+        self.assertIn("0 dropped", output)
+
+    def test_verified_opportunity_defaults_to_verified_status(self):
+        from scanner.models import ComparableEvidence, ProductIdentification, ResaleValuation
+
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.return_value = mock.Mock(
+                                status="verified", price=199.0, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            opportunities = run_discovery(self._config())
+
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0].verification_status, "verified")
 
     def test_verified_candidate_reaches_identify_product_with_authoritative_price(self):
-        from scanner.models import ProductIdentification, ResaleValuation
+        from scanner.models import ComparableEvidence, ProductIdentification, ResaleValuation
 
         with mock.patch("scanner.discover.verify_listing") as mock_verify:
             with mock.patch("scanner.discover.identify_product") as mock_identify:
@@ -259,6 +621,768 @@ class TestRunDiscoveryVerificationGate(_RunDiscoveryTestBase):
         output = buf.getvalue()
         self.assertIn("verification:", output)
         self.assertIn("1 dropped", output)
+
+
+class TestRunDiscoveryAuctionSourceWiring(_RunDiscoveryTestBase):
+    """Phase: connect the existing (previously unused) AuctionSearchSource
+    to discover.py. It must be built from the same config dict passed into
+    run_discovery(), and called once per run with no query argument (it is
+    config-driven -- categories/sites come from config, not from a query
+    string, unlike Tavily)."""
+
+    def test_auction_search_source_constructed_from_run_config(self):
+        cfg = self._config()
+        run_discovery(cfg)
+        self.mock_auction_source_cls.assert_called_once_with(cfg)
+
+    def test_auction_source_search_called_with_no_query_args(self):
+        # config-driven, not query-driven -- the only argument search() ever
+        # receives is turners_categories (filtered per discovery.include_vehicles,
+        # see TestDiscoveryVehicleExclusion below), never a query string.
+        run_discovery(self._config())
+        self.mock_auction_source.search.assert_called_once_with(turners_categories=[])
+
+    def test_auction_source_called_before_the_first_tavily_query(self):
+        call_order = []
+        self.mock_auction_source.search.side_effect = lambda *a, **k: call_order.append("auction") or []
+        self.mock_source.search.side_effect = lambda *a, **k: call_order.append("tavily") or []
+
+        run_discovery(self._config(products=["Nintendo Switch"], max_queries=2))
+
+        self.assertGreater(len(call_order), 0)
+        self.assertEqual(call_order[0], "auction")
+        self.assertIn("tavily", call_order)
+
+
+class TestDiscoveryVehicleExclusion(_RunDiscoveryTestBase):
+    """discovery.include_vehicles gates ONLY the turners_categories list
+    passed into AuctionSearchSource.search() for discover-mode runs. Scan
+    mode (main.py) fetches Turners General Goods/Vehicles via its own
+    separate call path (fetch_turners_category/fetch_turners_vehicles) and
+    never goes through discover.py, so it is untouched by this flag --
+    that's a structural guarantee, not something these tests can exercise."""
+
+    ALL_CATEGORIES = ["Electronics & Tech", "Cars", "Trucks & Machinery", "Motorbikes", "Trailers & Caravans"]
+
+    def _config_with_categories(self, include_vehicles=None):
+        cfg = self._config()
+        cfg["turners_categories"] = list(self.ALL_CATEGORIES)
+        if include_vehicles is not None:
+            cfg["discovery"]["include_vehicles"] = include_vehicles
+        return cfg
+
+    def test_vehicles_excluded_when_flag_false(self):
+        run_discovery(self._config_with_categories(include_vehicles=False))
+        self.mock_auction_source.search.assert_called_once_with(
+            turners_categories=["Electronics & Tech"]
+        )
+
+    def test_vehicles_included_when_flag_true(self):
+        run_discovery(self._config_with_categories(include_vehicles=True))
+        self.mock_auction_source.search.assert_called_once_with(
+            turners_categories=self.ALL_CATEGORIES
+        )
+
+    def test_vehicles_included_by_default_when_flag_absent(self):
+        # Backwards compatibility: no discovery.include_vehicles key at all
+        # must behave exactly as it did before this flag existed.
+        run_discovery(self._config_with_categories(include_vehicles=None))
+        self.mock_auction_source.search.assert_called_once_with(
+            turners_categories=self.ALL_CATEGORIES
+        )
+
+
+class TestRunDiscoveryAuctionSourceCandidates(_RunDiscoveryTestBase):
+    """Turners candidates sourced via AuctionSearchSource must flow through
+    exactly the same is_individual_listing_url() -> cap -> verify_listing()
+    -> identify_product()/research_comparables()/valuation/scoring pipeline
+    as Tavily results -- no special-casing downstream of candidate sourcing."""
+
+    TURNERS_URL = "https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/28374370/"
+
+    def setUp(self):
+        super().setUp()
+        self.mock_auction_source.search.return_value = [
+            _result(self.TURNERS_URL, title="Canon EOS 200D DSLR", price=120.0),
+        ]
+
+    def _run_with_mocked_pipeline(self, verify_status="verified", verify_price=120.0):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.return_value = mock.Mock(
+                                status=verify_status, price=verify_price, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            opportunities = run_discovery(self._config())
+        return opportunities, mock_identify
+
+    def test_turners_candidate_enters_discovery_and_becomes_an_opportunity(self):
+        opportunities, mock_identify = self._run_with_mocked_pipeline()
+
+        mock_identify.assert_called_once()
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0].url, self.TURNERS_URL)
+        self.assertEqual(opportunities[0].source, "Turners")
+        # Verification overwrites the price with the authoritative one, same
+        # as it does for every other source.
+        self.assertEqual(opportunities[0].current_price, 120.0)
+
+    def test_turners_candidate_still_subject_to_the_verification_gate(self):
+        opportunities, mock_identify = self._run_with_mocked_pipeline(
+            verify_status="unavailable", verify_price=None
+        )
+
+        self.assertEqual(opportunities, [])
+        mock_identify.assert_not_called()
+
+    def test_non_listing_turners_url_never_becomes_a_candidate(self):
+        # A Turners category/search page (no trailing item id) must be
+        # rejected the same way it would be for a Tavily result -- Turners
+        # sourcing does not bypass is_individual_listing_url().
+        self.mock_auction_source.search.return_value = [
+            _result("https://www.turners.co.nz/General-Goods/Search/electronics/", title="Category page"),
+        ]
+        with mock.patch("scanner.discover.identify_product") as mock_identify:
+            opportunities = run_discovery(self._config())
+
+        self.assertEqual(opportunities, [])
+        mock_identify.assert_not_called()
+
+
+class TestRunDiscoveryGeneralGoodsPrioritisedOverVehiclesEndToEnd(_RunDiscoveryTestBase):
+    """End-to-end regression test for the Run #40 business-priority change:
+    when General Goods has enough viable candidates to fill the whole
+    max_research_items budget on its own, Vehicles must receive ZERO paid
+    research this run -- all the way through to identify_product(), not
+    just inside _select_research_candidates() in isolation.
+
+    This replaces the pre-Run-#40 guarantee (Run #35's failure mode: a
+    large pool of $1 starting-bid General Goods candidates locking
+    Vehicles out by outnumbering them) -- that protection produced exactly
+    the outcome asserted here now, deliberately, as a business decision
+    rather than a bug: Run #40 spent 2 of 5 research slots on a motorbike
+    and a farm bike, categories the $500->$10k strategy has asked to
+    deprioritise for paid research."""
+
+    def setUp(self):
+        super().setUp()
+        gg_candidates = [
+            _auction_result(
+                f"https://www.turners.co.nz/General-Goods/Search/electronics/cameras/{i}/",
+                title=f"GG item {i}", price=1.0, price_type="starting_bid",
+            )
+            for i in range(40)  # far more than max_research_items=5
+        ]
+        vehicle_candidates = [
+            _auction_result(
+                f"https://www.turners.co.nz/Cars/Used-Cars-for-Sale/{200000 + i}/",
+                title=f"Vehicle {i}", price=1.0, price_type="current_bid",
+            )
+            for i in range(3)
+        ]
+        # General Goods listed first, exactly mirroring config.json's
+        # turners_categories order (General Goods categories before Cars/
+        # Trucks & Machinery/Motorbikes/Trailers & Caravans) and
+        # AuctionSearchSource.search()'s iteration order.
+        self.mock_auction_source.search.return_value = gg_candidates + vehicle_candidates
+
+    def _run(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.side_effect = lambda url, cache: mock.Mock(
+                                status="verified", price=1.0, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            run_discovery(self._config())
+        return {call.args[0] for call in mock_identify.call_args_list}
+
+    def test_no_vehicle_candidate_reaches_identify_product_when_gg_pool_is_sufficient(self):
+        identified_titles = self._run()
+        vehicle_titles = {t for t in identified_titles if t.startswith("Vehicle")}
+        self.assertEqual(
+            len(vehicle_titles), 0,
+            f"expected zero Vehicle candidates among identified titles (GG pool of 40 "
+            f"exceeds the max_research_items=5 budget on its own), got: {identified_titles}",
+        )
+
+    def test_general_goods_fills_the_entire_budget_instead(self):
+        identified_titles = self._run()
+        gg_titles = {t for t in identified_titles if t.startswith("GG item")}
+        self.assertEqual(len(gg_titles), 5)
+
+
+class TestRunDiscoveryVehiclesGetOverflowSlotsEndToEnd(_RunDiscoveryTestBase):
+    """Companion to the class above: Vehicles are deprioritised, not
+    excluded. When General Goods can't fill the whole max_research_items
+    budget on its own this run, the leftover slots must still roll over to
+    Vehicles end-to-end -- proving discovery still finds/researches
+    vehicle candidates, just only once higher-priority candidates run
+    out."""
+
+    def setUp(self):
+        super().setUp()
+        gg_candidates = [
+            _auction_result(
+                f"https://www.turners.co.nz/General-Goods/Search/electronics/cameras/{i}/",
+                title=f"GG item {i}", price=1.0, price_type="starting_bid",
+            )
+            for i in range(2)  # fewer than max_research_items=5
+        ]
+        vehicle_candidates = [
+            _auction_result(
+                f"https://www.turners.co.nz/Cars/Used-Cars-for-Sale/{200000 + i}/",
+                title=f"Vehicle {i}", price=1.0, price_type="current_bid",
+            )
+            for i in range(5)
+        ]
+        self.mock_auction_source.search.return_value = gg_candidates + vehicle_candidates
+
+    def test_vehicles_fill_the_leftover_research_slots(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.side_effect = lambda url, cache: mock.Mock(
+                                status="verified", price=1.0, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            run_discovery(self._config())
+
+        identified_titles = {call.args[0] for call in mock_identify.call_args_list}
+        gg_titles = {t for t in identified_titles if t.startswith("GG item")}
+        vehicle_titles = {t for t in identified_titles if t.startswith("Vehicle")}
+        self.assertEqual(len(gg_titles), 2)      # both GG candidates used
+        self.assertEqual(len(vehicle_titles), 3)  # remaining 3 of the 5-slot budget roll over
+
+
+class TestRunDiscoveryStartingBidValuationSemantics(_RunDiscoveryTestBase):
+    """Phase 4B follow-up regression tests: a `starting_bid` price must not
+    be represented as though it were a confirmed acquisition price for
+    profit/ROI purposes, while the observed bid itself, cost modelling, and
+    max_buy_price (all price-agnostic or explicitly-labelled-as-observed)
+    remain exactly as before."""
+
+    TURNERS_URL = "https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/28374370/"
+
+    def _run(self, price_type, verify_price=1.0):
+        self.mock_auction_source.search.return_value = [
+            _auction_result(self.TURNERS_URL, title="Canon Powershot", price=1.0, price_type=price_type),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.return_value = mock.Mock(
+                                status="verified", price=verify_price, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            # A real ResaleValuation with quick_sale set, so
+                            # the real (unmocked) apply_valuation() /
+                            # compute_profit_and_roi() actually run --
+                            # unlike most other tests in this file, this one
+                            # needs to exercise that real arithmetic.
+                            mock_trader.return_value = (
+                                ResaleValuation(quick_sale_low=400.0, quick_sale_high=550.0, confidence_pct=4.0),
+                                {"ran": True},
+                            )
+                            opportunities = run_discovery(self._config())
+        self.assertEqual(len(opportunities), 1)
+        return opportunities[0]
+
+    def test_starting_bid_does_not_produce_expected_profit_or_roi(self):
+        opp = self._run(price_type="starting_bid")
+
+        self.assertEqual(opp.price_type, "starting_bid")
+        # The observed bid is preserved as observed data -- not hidden, not
+        # replaced with an estimate.
+        self.assertEqual(opp.current_price, 1.0)
+        # But it must not be represented as a confirmed acquisition price
+        # for profit/ROI purposes.
+        self.assertIsNone(opp.expected_net_profit_low)
+        self.assertIsNone(opp.expected_net_profit_high)
+        self.assertIsNone(opp.roi_low_pct)
+        self.assertIsNone(opp.roi_high_pct)
+
+    def test_starting_bid_max_buy_price_is_still_computed(self):
+        # max_buy_price is price-agnostic (depends on quick_sale_value and
+        # cost_model, not on current_price/price_type) -- it is the
+        # legitimate, actionable ceiling regardless of auction stage, and
+        # must not be suppressed by this fix.
+        opp = self._run(price_type="starting_bid")
+        self.assertIsNotNone(opp.max_buy_price)
+        self.assertGreater(opp.max_buy_price, 0)
+
+    def test_current_bid_with_same_price_still_produces_profit_and_roi(self):
+        # Proves the fix is scoped to price_type == "starting_bid" only --
+        # a real current_bid at the same $1 price is unaffected.
+        opp = self._run(price_type="current_bid")
+
+        self.assertEqual(opp.price_type, "current_bid")
+        self.assertIsNotNone(opp.expected_net_profit_low)
+        self.assertIsNotNone(opp.roi_low_pct)
+
+    def test_unknown_price_type_non_turners_behaviour_unchanged(self):
+        # price_type is None for every existing (pre-Phase-4B) source --
+        # Tavily/SerpAPI/Brave never set it. Profit/ROI computation for
+        # those candidates must be completely unaffected by this change.
+        opp = self._run(price_type=None)
+
+        self.assertIsNone(opp.price_type)
+        self.assertIsNotNone(opp.expected_net_profit_low)
+        self.assertIsNotNone(opp.roi_low_pct)
+
+
+class TestRunDiscoveryAuctionWinsCanonicalDuplicate(_RunDiscoveryTestBase):
+    """Turners is processed before Tavily specifically so that when the same
+    listing is found by both, the Turners copy (real scraped price) wins the
+    canonical-URL duplicate check and Tavily's copy (snippet-only, often no
+    price) is dropped."""
+
+    TURNERS_URL = "https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/28374370/"
+
+    def setUp(self):
+        super().setUp()
+        self.mock_auction_source.search.return_value = [
+            _result(self.TURNERS_URL, title="Turners: Canon EOS 200D", price=120.0),
+        ]
+        # Same listing, different query string -- canonicalize_url() strips
+        # tracking params, so this must still collapse to the same key.
+        self.mock_source.search.return_value = [
+            _result(
+                self.TURNERS_URL + "?utm_source=newsletter",
+                title="Tavily snippet: Canon camera",
+                price=None,
+            ),
+        ]
+
+    def test_process_query_results_logs_the_tavily_copy_as_a_duplicate(self):
+        seen: set = set()
+        _process_query_results(
+            "auction_source:turners", ["turners.co.nz"],
+            self.mock_auction_source.search.return_value, seen,
+        )
+        tavily_entry, tavily_unique = _process_query_results(
+            "some tavily query", ["turners.co.nz"],
+            self.mock_source.search.return_value, seen,
+        )
+        self.assertEqual(tavily_entry["rejected_duplicate"], 1)
+        self.assertEqual(tavily_unique, [])
+
+    def test_only_one_opportunity_survives_and_it_is_the_turners_copy(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.return_value = mock.Mock(
+                                status="verified", price=120.0, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            opportunities = run_discovery(self._config())
+
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0].title, "Turners: Canon EOS 200D")
+        mock_identify.assert_called_once()
+
+
+class TestRunDiscoveryExistingTavilyBehaviourIntact(_RunDiscoveryTestBase):
+    """Adding the auction source must not change Tavily's own call shape or
+    the include_domains behaviour already covered above -- these are a
+    couple of extra direct checks against interference between the two
+    sources sharing one run."""
+
+    def test_tavily_still_receives_include_domains_with_auction_source_wired_in(self):
+        run_discovery(self._config())
+        self.assertTrue(self.mock_source.search.called)
+        for call in self.mock_source.search.call_args_list:
+            self.assertEqual(call.kwargs.get("include_domains"), DEFAULT_DISCOVERY_DOMAINS)
+
+    def test_auction_source_results_do_not_leak_into_tavily_call_kwargs(self):
+        # Deliberately a category page, not an individual listing -- it must
+        # never reach candidates/verify_listing (a real network call), since
+        # this test only cares about what discover.py passes to Tavily.
+        self.mock_auction_source.search.return_value = [
+            _result("https://www.turners.co.nz/General-Goods/Search/electronics/"),
+        ]
+        run_discovery(self._config())
+        for call in self.mock_source.search.call_args_list:
+            self.assertNotIn("turners_categories", call.kwargs)
+
+    def test_tavily_still_runs_when_auction_source_raises_unexpectedly(self):
+        # AuctionSearchSource itself already swallows its own scraper-level
+        # failures (see tests/test_auction_search.py) -- this covers the
+        # last-resort guard in run_discovery() for a genuinely unexpected
+        # failure (e.g. a bug in the class itself), confirming it can never
+        # take down the Tavily loop in the same run.
+        self.mock_auction_source.search.side_effect = RuntimeError("unexpected")
+        result = run_discovery(self._config())
+
+        self.assertEqual(result, [])
+        self.assertTrue(self.mock_source.search.called)
+
+
+class TestRunDiscoveryTavilyUnavailable(_RunDiscoveryTestBase):
+    """Regression: an unavailable WebSearchSource must not exit
+    run_discovery() early. Turners direct-scrape discovery
+    (AuctionSearchSource) has its own working scrapers and does not depend
+    on a Tavily/web-search API key at all -- the old `return []` right
+    after the availability check predates AuctionSearchSource being wired
+    into this function and was only ever correct when Tavily was the sole
+    candidate source discover.py had."""
+
+    TURNERS_URL = "https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/28374370/"
+
+    def setUp(self):
+        super().setUp()
+        self.mock_source.available = False  # simulate no WEB_SEARCH_PROVIDER/API key configured
+        self.mock_auction_source.search.return_value = [
+            _result(self.TURNERS_URL, title="Canon EOS 200D DSLR", price=120.0),
+        ]
+
+    def test_does_not_return_early_when_web_search_unavailable(self):
+        # Direct regression guard: if the old hard `return []` were ever
+        # reintroduced, AuctionSearchSource would never be constructed and
+        # this assertion would fail. verify_listing is mocked purely so the
+        # Turners candidate doesn't reach a real network call -- this test
+        # only cares that AuctionSearchSource was constructed and searched.
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            mock_verify.return_value = mock.Mock(status="unavailable", price=None, reason="test-mocked")
+            run_discovery(self._config())
+        self.mock_auction_source_cls.assert_called_once()
+
+    def test_auction_source_still_runs_and_tavily_query_loop_is_skipped(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            mock_verify.return_value = mock.Mock(status="unavailable", price=None, reason="test-mocked")
+            run_discovery(self._config())
+
+        self.mock_auction_source.search.assert_called_once_with(turners_categories=[])
+        # No queries were generated (no Tavily provider to query) -- Tavily's
+        # search() must never be called in this run.
+        self.mock_source.search.assert_not_called()
+
+    def test_turners_candidate_reaches_verification_and_becomes_an_opportunity(self):
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_verify.return_value = mock.Mock(
+                                status="verified", price=120.0, is_live=True, reason=""
+                            )
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            opportunities = run_discovery(self._config())
+
+        mock_verify.assert_called_once_with(self.TURNERS_URL, mock.ANY)
+        mock_identify.assert_called_once()
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0].url, self.TURNERS_URL)
+        self.assertEqual(opportunities[0].source, "Turners")
+        self.assertEqual(opportunities[0].current_price, 120.0)
+
+    def test_turners_candidate_still_gated_by_verification_when_tavily_unavailable(self):
+        # The verification gate (Phase 4B.1) must keep applying to Turners
+        # candidates regardless of why Tavily wasn't queried this run.
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                mock_verify.return_value = mock.Mock(status="unavailable", price=None, reason="no price")
+                opportunities = run_discovery(self._config())
+
+        self.assertEqual(opportunities, [])
+        mock_identify.assert_not_called()
+
+    def test_returns_empty_list_not_none_when_both_sources_have_nothing(self):
+        self.mock_auction_source.search.return_value = []
+        result = run_discovery(self._config())
+        self.assertEqual(result, [])
+
+
+class TestRunDiscoveryTavilyAvailablePathUnchanged(_RunDiscoveryTestBase):
+    """Companion to TestRunDiscoveryTavilyUnavailable above: when a web
+    search provider IS configured, the query-generation/search path must be
+    byte-for-byte what it was before Turners direct-scrape discovery was
+    wired in -- decoupling the unavailable case must not touch this branch."""
+
+    def test_queries_are_generated_and_tavily_is_searched_when_available(self):
+        # self.mock_source.available stays True (the _RunDiscoveryTestBase
+        # default) -- this is the existing Tavily-enabled behaviour.
+        run_discovery(self._config(max_queries=3, products=["Nintendo Switch"]))
+
+        self.assertTrue(self.mock_source.search.called)
+        for call in self.mock_source.search.call_args_list:
+            self.assertEqual(call.kwargs.get("include_domains"), DEFAULT_DISCOVERY_DOMAINS)
+
+
+
+class TestRunDiscoveryUnsupportedSourceBypassesResearchCap(_RunDiscoveryTestBase):
+    """Phase 4B.4: unsupported-source candidates (Trade Me today, anything
+    else verify_listing() can't verify tomorrow) must not compete with
+    Turners for the max_research_items-capped research slots. They cost
+    zero AI/Tavily budget regardless -- verify_listing() never makes an
+    HTTP request for them (see scanner/listing_verification.py) -- so
+    letting one win a round-robin slot never saved any AI spend; it only
+    ever cost a Turners candidate its shot at the real research pipeline.
+    See run_discovery()'s research_eligible/bypass_candidates split."""
+
+    def _verify_side_effect(self, turners_price=50.0):
+        def _verify(url, cache):
+            if "turners.co.nz" in url:
+                return mock.Mock(status="verified", price=turners_price, is_live=True, reason="")
+            return mock.Mock(
+                status="unsupported", price=None,
+                reason="Trade Me listing pages are disallowed by robots.txt",
+            )
+        return _verify
+
+    def _turners_candidates(self, n, price=50.0):
+        return [
+            _auction_result(
+                f"https://www.turners.co.nz/General-Goods/Search/electronics/cameras/{i}/",
+                title=f"Turners item {i}", price=price, price_type="current_bid",
+            )
+            for i in range(n)
+        ]
+
+    def _trademe_candidates(self, n):
+        return [
+            _result(f"https://www.trademe.co.nz/a/marketplace/listing/{1000 + i}", title=f"Trade Me item {i}")
+            for i in range(n)
+        ]
+
+    def _run_with_full_pipeline_mocked(self, turners_n, trademe_n):
+        self.mock_auction_source.search.return_value = self._turners_candidates(turners_n)
+        self.mock_source.search.return_value = self._trademe_candidates(trademe_n)
+        with mock.patch("scanner.discover.verify_listing", side_effect=self._verify_side_effect()):
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch(
+                    "scanner.discover.research_comparables", return_value=[]
+                ) as mock_comparables:
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        with mock.patch("scanner.discover.trader_review") as mock_trader:
+                            mock_identify.return_value = ProductIdentification()
+                            mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                            opportunities = run_discovery(self._config())
+        return opportunities, mock_identify, mock_comparables
+
+    def test_trademe_candidates_do_not_consume_research_slots(self):
+        # Exactly max_research_items=5 Turners candidates + 3 Trade Me
+        # candidates. If Trade Me competed for slots, at least one Turners
+        # candidate would lose out; instead all 5 Turners candidates must
+        # still be researched, on top of all 3 Trade Me leads preserved.
+        opportunities, mock_identify, _ = self._run_with_full_pipeline_mocked(turners_n=5, trademe_n=3)
+
+        turners_opps = [o for o in opportunities if o.source == "Turners"]
+        trademe_opps = [o for o in opportunities if o.source == "Trade Me"]
+        self.assertEqual(len(turners_opps), 5)
+        self.assertEqual(len(trademe_opps), 3)
+        # identify_product is only ever called for candidates that reached
+        # the real research pipeline -- never for Trade Me.
+        self.assertEqual(mock_identify.call_count, 5)
+
+    def test_multiple_trademe_candidates_are_all_preserved_as_watch(self):
+        opportunities, mock_identify, mock_comparables = self._run_with_full_pipeline_mocked(
+            turners_n=0, trademe_n=4
+        )
+
+        self.assertEqual(len(opportunities), 4)
+        self.assertTrue(all(o.source == "Trade Me" for o in opportunities))
+        self.assertTrue(all(o.decision == "WATCH" for o in opportunities))
+        self.assertTrue(all(o.verification_status == "unsupported" for o in opportunities))
+        self.assertTrue(all(o.flip_score is None for o in opportunities))
+        mock_identify.assert_not_called()
+        mock_comparables.assert_not_called()
+
+    def test_turners_gets_the_full_research_budget_despite_trademe_candidates(self):
+        # 8 Turners candidates (more than max_research_items=5) alongside 2
+        # Trade Me candidates. Previously Trade Me could take one of the 5
+        # slots away from Turners via the round-robin; now all 5 slots go
+        # to Turners regardless of how many Trade Me candidates exist.
+        opportunities, mock_identify, _ = self._run_with_full_pipeline_mocked(turners_n=8, trademe_n=2)
+
+        turners_opps = [o for o in opportunities if o.source == "Turners"]
+        trademe_opps = [o for o in opportunities if o.source == "Trade Me"]
+        self.assertEqual(len(turners_opps), 5)  # full max_research_items budget, all Turners
+        self.assertEqual(len(trademe_opps), 2)  # both still preserved, uncapped
+        self.assertEqual(mock_identify.call_count, 5)
+
+    def test_ai_and_tavily_research_call_counts_unchanged_by_trademe_presence(self):
+        # 5 Turners candidates with zero Trade Me candidates must produce
+        # identical identify_product/research_comparables call counts to
+        # the same 5 Turners candidates alongside 3 extra Trade Me
+        # candidates -- proving Trade Me's presence never adds to (or
+        # removes from) the paid research cost.
+        _, mock_identify_without, mock_comparables_without = self._run_with_full_pipeline_mocked(
+            turners_n=5, trademe_n=0
+        )
+        _, mock_identify_with, mock_comparables_with = self._run_with_full_pipeline_mocked(
+            turners_n=5, trademe_n=3
+        )
+
+        self.assertEqual(mock_identify_without.call_count, 5)
+        self.assertEqual(mock_identify_without.call_count, mock_identify_with.call_count)
+        self.assertEqual(mock_comparables_without.call_count, mock_comparables_with.call_count)
+
+    def test_run_metadata_distinguishes_total_from_researched_candidates(self):
+        self.mock_auction_source.search.return_value = self._turners_candidates(8)
+        self.mock_source.search.return_value = self._trademe_candidates(3)
+
+        captured_meta = {}
+
+        def _capture_write(opportunities, run_meta, *a, **kw):
+            captured_meta.update(run_meta)
+            return "reports/discovery_test.json", {}
+
+        with mock.patch("scanner.discover.write_discovery_report", side_effect=_capture_write):
+            with mock.patch("scanner.discover.verify_listing", side_effect=self._verify_side_effect()):
+                with mock.patch("scanner.discover.identify_product") as mock_identify:
+                    with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                        with mock.patch("scanner.discover.research", return_value={}):
+                            with mock.patch("scanner.discover.trader_review") as mock_trader:
+                                mock_identify.return_value = ProductIdentification()
+                                mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                                run_discovery(self._config())
+
+        # 8 Turners + 3 Trade Me = 11 individual-listing candidates found
+        # this run -- the true funnel size, independent of the cap.
+        self.assertEqual(captured_meta["candidates_found"], 11)
+        # Only max_research_items=5 Turners candidates were selected for
+        # (and consumed) the paid research pipeline.
+        self.assertEqual(captured_meta["candidates_selected_for_research"], 5)
+        self.assertEqual(captured_meta["candidates_verified"], 5)
+        self.assertEqual(captured_meta["candidates_verification_unsupported"], 3)
+        self.assertEqual(captured_meta["candidates_verification_dropped"], 0)
+
+    def test_run_metadata_candidates_found_can_exceed_selected_when_no_bypass_candidates(self):
+        # Sanity check the two metadata fields are independent even in the
+        # Turners-only case (no bypass candidates at all): candidates_found
+        # and candidates_selected_for_research both equal the same number
+        # only because every candidate happened to be Turners-eligible AND
+        # fit within the cap -- not because they're aliases of each other.
+        self.mock_auction_source.search.return_value = self._turners_candidates(3)
+        self.mock_source.search.return_value = []
+
+        captured_meta = {}
+
+        def _capture_write(opportunities, run_meta, *a, **kw):
+            captured_meta.update(run_meta)
+            return "reports/discovery_test.json", {}
+
+        with mock.patch("scanner.discover.write_discovery_report", side_effect=_capture_write):
+            with mock.patch("scanner.discover.verify_listing", side_effect=self._verify_side_effect()):
+                with mock.patch("scanner.discover.identify_product") as mock_identify:
+                    with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                        with mock.patch("scanner.discover.research", return_value={}):
+                            with mock.patch("scanner.discover.trader_review") as mock_trader:
+                                mock_identify.return_value = ProductIdentification()
+                                mock_trader.return_value = (ResaleValuation(), {"ran": False})
+                                run_discovery(self._config())
+
+        self.assertEqual(captured_meta["candidates_found"], 3)
+        self.assertEqual(captured_meta["candidates_selected_for_research"], 3)
+
+
+class TestRunDiscoveryPassesIdentificationConfidenceToTrader(_RunDiscoveryTestBase):
+    """Phase 4B.5 bug fix regression: trader_review must receive the real
+    identify_product() confidence, and it must actually move the resulting
+    valuation confidence -- previously this signal never reached
+    build_valuation_from_evidence() at all (trader.py derived it from its
+    own reject_valuation verdict instead). trader_review is deliberately
+    left unmocked here (api_key is empty in _config(), so it safely takes
+    the no-network fallback path) so the real wiring is exercised
+    end-to-end."""
+
+    TURNERS_URL = "https://www.turners.co.nz/General-Goods/Search/electronics/misc/1/"
+
+    def _run(self, model_identified_confidently):
+        self.mock_auction_source.search.return_value = [
+            _auction_result(self.TURNERS_URL, title="Widget", price=50.0, price_type="current_bid"),
+        ]
+        evidence = [
+            ComparableEvidence("Widget", "", "used", 300.0, "NZD", "TradeMe", "u1",
+                                "2026-08-16T00:00:00+00:00", 0.9, True),
+            ComparableEvidence("Widget", "", "used", 310.0, "NZD", "TradeMe", "u2",
+                                "2026-08-16T00:00:00+00:00", 0.85, True),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=evidence):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        mock_verify.return_value = mock.Mock(
+                            status="verified", price=50.0, is_live=True, reason=""
+                        )
+                        mock_identify.return_value = ProductIdentification(
+                            model_identified_confidently=model_identified_confidently
+                        )
+                        opportunities = run_discovery(self._config())
+        self.assertEqual(len(opportunities), 1)
+        return opportunities[0]
+
+    def test_confident_identification_yields_higher_valuation_confidence(self):
+        confident_opp = self._run(model_identified_confidently=True)
+        unconfident_opp = self._run(model_identified_confidently=False)
+        self.assertGreater(
+            confident_opp.valuation.confidence_pct,
+            unconfident_opp.valuation.confidence_pct,
+        )
+
+
+class TestLowSimilaritySoldEvidenceLiquidityVsValuation(_RunDiscoveryTestBase):
+    """Phase 4B.5: MIN_COMPARABLE_SIMILARITY must only gate valuation price
+    calculations. estimate_liquidity() must keep receiving the full,
+    unfiltered evidence list -- a low-similarity SOLD comparable should
+    still count toward liquidity even though it can't set quick_sale_low."""
+
+    TURNERS_URL = "https://www.turners.co.nz/General-Goods/Search/electronics/misc/2/"
+
+    def test_low_similarity_sold_evidence_excluded_from_valuation_but_counted_in_liquidity(self):
+        self.mock_auction_source.search.return_value = [
+            _auction_result(self.TURNERS_URL, title="Gadget", price=50.0, price_type="current_bid"),
+        ]
+        evidence = [
+            # Low similarity (0.10, well under MIN_COMPARABLE_SIMILARITY=0.30)
+            # but a confirmed sale -- must count for liquidity, must not be
+            # able to set quick_sale_low.
+            ComparableEvidence("Gadget", "", "used", 50.0, "NZD", "eBay", "u1",
+                                "2026-08-16T00:00:00+00:00", 0.10, True, evidence_type="SOLD"),
+            # High similarity, not sold -- the only evidence allowed to set
+            # the valuation numbers here.
+            ComparableEvidence("Gadget", "", "used", 500.0, "NZD", "Trade Me", "u2",
+                                "2026-08-16T00:00:00+00:00", 0.80, False, evidence_type="CURRENT_LISTING"),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.identify_product") as mock_identify:
+                with mock.patch("scanner.discover.research_comparables", return_value=evidence):
+                    with mock.patch("scanner.discover.research", return_value={}):
+                        mock_verify.return_value = mock.Mock(
+                            status="verified", price=50.0, is_live=True, reason=""
+                        )
+                        mock_identify.return_value = ProductIdentification(model_identified_confidently=True)
+                        opportunities = run_discovery(self._config())
+
+        self.assertEqual(len(opportunities), 1)
+        opp = opportunities[0]
+
+        # Valuation floor comes only from the $500 high-similarity comp,
+        # not the $50 low-similarity one.
+        self.assertEqual(opp.valuation.quick_sale_low, round(500.0 * 0.9, 2))
+        # But liquidity still sees the sold comp -- one is_sold=True item
+        # is enough for MEDIUM per scanner/liquidity.py, unaffected by the
+        # similarity filter.
+        self.assertEqual(opp.liquidity, "MEDIUM")
+        # Full evidence (both items) still present for inspection.
+        self.assertEqual(len(opp.valuation.evidence), 2)
 
 
 if __name__ == "__main__":

@@ -244,6 +244,7 @@
       "turners.co.nz",
       "thorntons.net.nz",
       "mainlandauctions.nz"
-    ]
+    ],
+    "include_vehicles": false
   }
 }

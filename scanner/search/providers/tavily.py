@@ -81,7 +81,13 @@ class TavilySearchProvider(SearchProvider):
                     title=item.get("title", ""),
                     url=item.get("url", ""),
                     price=None,
-                    currency="NZD",
+                    # This provider's response has no structured currency
+                    # field -- leave unset (falsy) so build_comparables_from_
+                    # search_results() in comparable_research.py falls through
+                    # to text/domain-based inference instead of a wrongly-
+                    # assumed NZD. Never hardcode a currency this provider
+                    # doesn't actually know.
+                    currency="",
                     source="web_search:tavily",
                     description=item.get("content", ""),
                     condition="unknown",

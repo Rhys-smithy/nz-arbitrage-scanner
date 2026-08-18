@@ -105,6 +105,39 @@ class Opportunity:
     url: str
     source: str
     current_price: Optional[float]
+    # Phase 4B follow-up: carried straight through from the discovery
+    # candidate's SearchResult.price_type (see scanner/search/base.py).
+    # "starting_bid" means current_price is the auction's opening number
+    # with zero bids placed -- valuation.py must not treat that as a
+    # confirmed acquisition price. None for non-Turners sources / unknown.
+    price_type: Optional[str] = None
+    # Phase 4B.2 follow-up (persistence port): same rationale as price_type
+    # above -- carried straight through from the discovery candidate's
+    # SearchResult fields (see scanner/search/base.py) so the persisted
+    # Opportunity record is self-contained for inspecting *why* a decision
+    # was made, without a UI/report needing to go back to the raw
+    # SearchResult. All optional/defaulted, same as on SearchResult --
+    # None/"" for any source that doesn't scrape them (non-Turners sources,
+    # and Turners Vehicles for reserve_status/closing_date/starts_on).
+    buy_now_price: Optional[float] = None
+    reserve_status: Optional[str] = None
+    closing_date: str = ""
+    starts_on: str = ""
+    # Phase 4B.3: "verified" (default) means listing_verification.verify_listing()
+    # re-fetched this candidate's own authoritative source and confirmed
+    # current_price/condition itself -- the normal case for every Turners
+    # opportunity today. "unsupported" marks a candidate from a source
+    # verify_listing() can never compliantly re-fetch (Trade Me/Thorntons/
+    # Mainland Auctions -- see scanner/listing_verification.py), preserved
+    # here instead of silently discarded so the search-provider signal
+    # isn't lost, but explicitly NOT independently confirmed:
+    # current_price/condition are whatever the search snippet said, and
+    # scanner/discover.py hardcodes decision="WATCH" for these -- this
+    # field is the unambiguous, testable marker that must never read
+    # "verified" for such a candidate. Additive field, keyword-only at
+    # every construction site (same pattern as buy_now_price etc. above),
+    # so no positional risk to any existing caller.
+    verification_status: str = "verified"
     identification: ProductIdentification = field(default_factory=ProductIdentification)
     valuation: ResaleValuation = field(default_factory=ResaleValuation)
     costs: CostBreakdown = field(default_factory=CostBreakdown)
