@@ -12,7 +12,7 @@ WEIGHTS = {
     "liquidity": 15, "price_confidence": 10, "condition_risk": 5, "capital_concentration": 5,
 }
 BANKROLL_CFG = {
-    "starting_bankroll": 500, "target_bankroll": 10000, "minimum_profit": 75,
+    "starting_bankroll": 500, "target_bankroll": 10000, "minimum_profit": 10,
     "minimum_roi_percent": 40, "maximum_single_purchase_percent": 40,
 }
 
@@ -68,7 +68,7 @@ class TestDecision(unittest.TestCase):
 
     def test_pass_below_profit_target(self):
         o = _strong_opportunity()
-        o.expected_net_profit_low = 10  # below $75 minimum
+        o.expected_net_profit_low = 5  # below $10 minimum
         o.flip_score = 90
         o.flip_score_band = "EXCELLENT"
         decision, reasons = decide(o, BANKROLL_CFG)

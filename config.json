@@ -162,7 +162,7 @@
   "bankroll": {
     "starting_bankroll": 500,
     "target_bankroll": 10000,
-    "minimum_profit": 75,
+    "minimum_profit": 10,
     "minimum_roi_percent": 40,
     "maximum_single_purchase_percent": 40
   },

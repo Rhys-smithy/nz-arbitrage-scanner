@@ -33,7 +33,7 @@ def compute_flip_score(opportunity: Opportunity, weights: dict, bankroll_cfg: di
     total = 0.0
 
     # 1. Expected net profit vs. minimum_profit target (full points at 3x target)
-    min_profit = max(1.0, bankroll_cfg.get("minimum_profit", 75))
+    min_profit = max(1.0, bankroll_cfg.get("minimum_profit", 10))
     profit = opportunity.expected_net_profit_low
     profit_factor = 0.0 if profit is None else max(0.0, min(1.0, profit / (min_profit * 3)))
     total += w.get("expected_net_profit", 25) * profit_factor
