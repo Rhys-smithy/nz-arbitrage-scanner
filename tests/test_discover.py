@@ -3,8 +3,10 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import unittest
+from collections import Counter
 from unittest import mock
 
+from scanner import scan_progress
 from scanner.discover import (
     DEFAULT_DISCOVERY_DOMAINS,
     _acquisition_evidence_tier,
@@ -386,6 +388,22 @@ class _RunDiscoveryTestBase(unittest.TestCase):
                 return_value=("reports/discovery_test.json", {}),
             ),
             mock.patch("scanner.discover.update_discovery_index"),
+            # Scan-progress telemetry (Command Centre "Run Scan" feature):
+            # run_discovery() calls scanner.scan_progress.update_progress()
+            # at several real points during a run (see its own docstring).
+            # Mocked here for the same reason write_discovery_report/
+            # update_discovery_index above are -- these tests exercise
+            # run_discovery() end-to-end and must not write real files to
+            # the actual data/scan_progress.json as a side effect. Patching
+            # the function directly on the real scanner.scan_progress
+            # module (rather than replacing scanner.discover.scan_progress
+            # wholesale) keeps STAGE_SEARCH/STAGE_VALIDATION/STAGE_RESEARCH/
+            # DEFAULT_PATH as their real string/path values in the dicts
+            # discover.py builds, so TestRunDiscoveryProgressInstrumentation
+            # below can assert on real stage names. Appended at the end so
+            # the existing self.mocks[4]/[5] index references above are
+            # unaffected.
+            mock.patch("scanner.scan_progress.update_progress"),
         ]
         self.mocks = [p.start() for p in patches]
         for p in patches:
@@ -398,6 +416,8 @@ class _RunDiscoveryTestBase(unittest.TestCase):
         self.mock_auction_source_cls = self.mocks[5]
         self.mock_auction_source = self.mock_auction_source_cls.return_value
         self.mock_auction_source.search.return_value = []  # no Turners results by default
+
+        self.mock_update_progress = self.mocks[8]
 
 
 class TestRunDiscoveryUsesIncludeDomains(_RunDiscoveryTestBase):
@@ -1383,6 +1403,150 @@ class TestLowSimilaritySoldEvidenceLiquidityVsValuation(_RunDiscoveryTestBase):
         self.assertEqual(opp.liquidity, "MEDIUM")
         # Full evidence (both items) still present for inspection.
         self.assertEqual(len(opp.valuation.evidence), 2)
+
+
+class TestRunDiscoveryProgressInstrumentation(_RunDiscoveryTestBase):
+    """Command Centre "Run Scan" telemetry: run_discovery() must report
+    real SEARCH/VALIDATION/RESEARCH progress via
+    scanner.scan_progress.update_progress() at the points described in its
+    own docstring -- never fabricated, never a global percentage (that
+    policy lives in the UI, but the counts this asserts on are exactly
+    what would make a fabricated percentage possible if abused, so it's
+    worth pinning the raw counts precisely here).
+
+    scanner.scan_progress.update_progress is mocked at the module level by
+    _RunDiscoveryTestBase.setUp() (self.mock_update_progress) -- these
+    tests never touch a real data/scan_progress.json.
+    """
+
+    TURNERS_URL_1 = "https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/1/"
+    TURNERS_URL_2 = "https://www.turners.co.nz/General-Goods/Search/electronics/cameras--equipment/2/"
+
+    def _patches_calls(self):
+        """Every dict passed as the first positional arg to
+        scan_progress.update_progress() across the whole run, in order."""
+        return [call.args[0] for call in self.mock_update_progress.call_args_list]
+
+    def test_reports_queries_total_before_the_search_loop_runs(self):
+        run_discovery(self._config(max_queries=3, products=["Nintendo Switch"]))
+        patches = self._patches_calls()
+        # The very first patch must already carry the real queries_total --
+        # it's known before either the Turners scrape or the Tavily loop
+        # starts (see run_discovery()'s own comment on this).
+        self.assertIn("queries_total", patches[0])
+        self.assertGreater(patches[0]["queries_total"], 0)
+
+    def test_reports_queries_completed_incrementally_one_per_query(self):
+        self.mock_source.search.return_value = []
+        run_discovery(self._config(max_queries=4, products=["Nintendo Switch"]))
+        patches = self._patches_calls()
+        queries_total = next(p["queries_total"] for p in patches if "queries_total" in p)
+        completed_values = [p["queries_completed"] for p in patches if "queries_completed" in p]
+        # One update per query, strictly increasing 1..N, never skipped or
+        # fabricated as a fraction. queries_total itself is asserted against
+        # allocate_discovery_queries()'s own real output (1 product + the
+        # default single "bundle" concept only ever produces 2 distinct
+        # queries, regardless of the 4-query budget) rather than hardcoding
+        # a number this test doesn't control.
+        self.assertEqual(completed_values, list(range(1, len(completed_values) + 1)))
+        self.assertEqual(completed_values[-1], queries_total)
+
+    def test_reports_raw_and_unique_result_counts(self):
+        self.mock_source.search.return_value = [
+            _result("https://www.trademe.co.nz/a/marketplace/electronics/listing/111"),
+            _result("https://www.trademe.co.nz/a/marketplace/electronics/listing/111"),  # duplicate
+        ]
+        run_discovery(self._config(max_queries=1, products=["Nintendo Switch"]))
+        patches = self._patches_calls()
+        final_raw = [p["raw_results"] for p in patches if "raw_results" in p][-1]
+        final_unique = [p["unique_results"] for p in patches if "unique_results" in p][-1]
+        # raw counts every result seen (including the duplicate); unique
+        # counts the canonical-URL-deduped set -- these must never be
+        # reported as equal here, since one of the two results is a
+        # genuine duplicate.
+        self.assertEqual(final_raw, 2)
+        self.assertEqual(final_unique, 1)
+
+    def test_reports_validation_stage_with_real_candidate_count(self):
+        self.mock_auction_source.search.return_value = [
+            _auction_result(self.TURNERS_URL_1, price=50.0, price_type="current_bid"),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            mock_verify.return_value = mock.Mock(status="unavailable", price=None, reason="no price")
+            run_discovery(self._config(max_queries=1))
+
+        patches = self._patches_calls()
+        validation_patch = next(p for p in patches if p.get("stage") == scan_progress.STAGE_VALIDATION)
+        self.assertEqual(validation_patch["candidates"], 1)
+        self.assertEqual(
+            validation_patch["stage_status"],
+            {"SEARCH": "done", "VALIDATION": "active", "RESEARCH": "pending"},
+        )
+
+    def test_reports_verified_count_incrementally_during_verification(self):
+        self.mock_auction_source.search.return_value = [
+            _auction_result(self.TURNERS_URL_1, price=50.0, price_type="current_bid"),
+            _auction_result(self.TURNERS_URL_2, price=60.0, price_type="current_bid"),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                mock_verify.side_effect = [
+                    mock.Mock(status="verified", price=50.0, reason=""),
+                    mock.Mock(status="unavailable", price=None, reason="no price"),
+                ]
+                run_discovery(self._config(max_queries=1))
+
+        verified_values = [p["verified"] for p in self._patches_calls() if "verified" in p]
+        # First candidate verifies (-> 1), second doesn't verify (count
+        # stays 1, but a heartbeat-refreshing update still fires -- see
+        # run_discovery()'s comment on why the "dropped"/"unsupported"
+        # branches also call update_progress).
+        self.assertEqual(verified_values, [1, 1])
+
+    def test_reports_research_stage_total_and_completed_with_decision_counts(self):
+        self.mock_auction_source.search.return_value = [
+            _auction_result(self.TURNERS_URL_1, price=50.0, price_type="current_bid"),
+        ]
+        with mock.patch("scanner.discover.verify_listing") as mock_verify:
+            with mock.patch("scanner.discover.research_comparables", return_value=[]):
+                mock_verify.return_value = mock.Mock(status="verified", price=50.0, reason="")
+                opportunities = run_discovery(self._config(max_queries=1))
+
+        self.assertEqual(len(opportunities), 1)
+        patches = self._patches_calls()
+        research_start = next(p for p in patches if p.get("stage") == scan_progress.STAGE_RESEARCH)
+        self.assertEqual(research_start["research_total"], 1)
+        self.assertEqual(
+            research_start["stage_status"],
+            {"SEARCH": "done", "VALIDATION": "done", "RESEARCH": "active"},
+        )
+
+        completed_patches = [p for p in patches if "research_completed" in p]
+        self.assertEqual(completed_patches[-1]["research_completed"], 1)
+        self.assertEqual(
+            completed_patches[-1]["decision_counts"],
+            dict(Counter([opportunities[0].decision])),
+        )
+
+        # After the per-candidate loop finishes, RESEARCH itself is marked
+        # done (stage stays RESEARCH -- see run_discovery()'s comment on why
+        # COMPLETE is main.py's responsibility, not this function's).
+        final_all_done = [
+            p for p in patches
+            if p.get("stage_status") == {"SEARCH": "done", "VALIDATION": "done", "RESEARCH": "done"}
+        ]
+        self.assertTrue(final_all_done)
+
+    def test_never_calls_complete_or_fail_itself(self):
+        # run_discovery() reports progress WITHIN a run but does not decide
+        # when the run is "complete" or "failed" -- that's main.py's job
+        # (see both modules' docstrings on why). Confirmed here via the
+        # patches list never containing a COMPLETE/FAILED stage.
+        run_discovery(self._config(max_queries=1))
+        patches = self._patches_calls()
+        stages_seen = {p["stage"] for p in patches if "stage" in p}
+        self.assertNotIn(scan_progress.STAGE_COMPLETE, stages_seen)
+        self.assertNotIn(scan_progress.STAGE_FAILED, stages_seen)
 
 
 if __name__ == "__main__":

@@ -903,5 +903,106 @@ class TestRenderLatestDealQueueWithHuntingState(unittest.TestCase):
         self.assertIn("liveMode = true;", html)
 
 
+class TestRunScanMarkup(unittest.TestCase):
+    """Command Centre "Run Scan" control + live-progress panel. Like
+    TestCommandCentreMarkup above, these are static-HTML/JS-source
+    regression guards, not a headless browser run -- see
+    tests/test_scan_progress.py and tests/test_dashboard_server.py for the
+    actual progress-telemetry and endpoint behaviour these markup pieces
+    talk to.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.index_path = os.path.join(self.tmpdir.name, "discovery_index.json")
+        self.output_path = os.path.join(self.tmpdir.name, "deal_queue.html")
+
+    def _persist_run(self, opportunities, **meta_overrides):
+        meta = {
+            "run_timestamp": "2026-08-19T09:00:00+00:00", "mode": "discover", "queries_run": 15,
+            "candidates_found": 5, "candidates_verified": 3, "candidates_verification_dropped": 2,
+            "opportunity_count": len(opportunities), "decision_counts": {},
+        }
+        meta.update(meta_overrides)
+        path, payload = write_discovery_report(opportunities, meta, reports_dir=self.tmpdir.name)
+        update_discovery_index(path, payload, index_path=self.index_path)
+        return payload
+
+    def _render(self, hunting_state_path=None):
+        render_latest_deal_queue(
+            index_path=self.index_path, reports_dir=self.tmpdir.name, output_path=self.output_path,
+            **({"hunting_state_path": hunting_state_path} if hunting_state_path else {}),
+        )
+        with open(self.output_path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_run_scan_button_and_status_panel_present(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn('id="scan-run-btn"', html)
+        self.assertIn("RUN SCAN", html)
+        self.assertIn('id="scan-status"', html)
+
+    def test_polls_scan_status_endpoint_not_faster_than_once_a_second(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn("fetch('/api/scan/status'", html)
+        self.assertIn("POST", html)  # sanity: POST is used somewhere (scan/start)
+        self.assertIn("/api/scan/start", html)
+        self.assertIn("var SCAN_POLL_MS = 1000;", html)
+
+    def test_no_overall_percentage_is_ever_rendered(self):
+        # Explicit product requirement: stage checklist + real item counts
+        # only, never a fabricated overall percentage bar.
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        scan_js = html.split("Run Scan: on-demand discovery scan")[1]
+        self.assertNotIn("%'", scan_js[:6000])
+        self.assertNotIn("progress-bar", scan_js[:6000])
+
+    def test_stage_status_glyphs_reflect_real_backend_field_not_invented(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn("data.stage_status", html)
+        self.assertIn("data.queries_completed", html)
+        self.assertIn("data.research_completed", html)
+        self.assertIn("data.decision_counts", html)
+
+    def test_completion_reloads_the_page_to_pick_up_regenerated_data(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn("window.location.reload()", html)
+
+    def test_scan_panel_does_not_mutate_discovery_payload_embedding(self):
+        # Regression guard mirroring
+        # test_discovery_payload_embedding_is_not_mutated_by_hunting_state
+        # in TestRenderLatestDealQueueWithHuntingState -- adding the Run
+        # Scan button/panel/script must not touch how the discovery
+        # payload is embedded.
+        payload = self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        start_marker = '<script id="discovery-report-data" type="application/json">'
+        end_marker = "</script>"
+        start = html.index(start_marker) + len(start_marker)
+        end = html.index(end_marker, start)
+        embedded_discovery = json.loads(html[start:end])
+        self.assertEqual(embedded_discovery, payload)
+
+    def test_scan_panel_does_not_mutate_hunting_payload_embedding(self):
+        state = {}
+        star(state, "Turners", "https://www.turners.co.nz/x")
+        hunting_path = os.path.join(self.tmpdir.name, "hunting_state.json")
+        save_hunting_state(state, hunting_path)
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render(hunting_state_path=hunting_path)
+        start_marker = '<script id="hunting-state-data" type="application/json">'
+        end_marker = "</script>"
+        start = html.index(start_marker) + len(start_marker)
+        end = html.index(end_marker, start)
+        embedded_hunting = json.loads(html[start:end])
+        self.assertEqual(embedded_hunting, {"hunting": state})
+
+
 if __name__ == "__main__":
     unittest.main()
