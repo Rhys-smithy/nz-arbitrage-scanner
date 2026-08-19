@@ -125,6 +125,45 @@ It's delivered straight to your Telegram chat as a file attachment (not
 just linked) so you don't need to dig through GitHub Actions artifacts to
 get it — look for the document alongside the text summary each run.
 
+## Hunting: starring opportunities to track
+
+`reports/deal_queue.html` (the Command Centre / Deal Queue dashboard) has a
+star on every opportunity. Starring one marks it "Hunting" -- I'm
+interested, keep tracking it -- and saves your own notes and target-offer
+price against it, kept completely separate from anything the scanner
+computes.
+
+`deal_queue.html` is a plain generated static file with no server of its
+own, so a star click has nowhere to write to unless something is
+listening. Run:
+
+```
+python -m scanner.dashboard_server
+```
+
+then open the URL it prints (`http://127.0.0.1:8765/deal_queue.html`)
+instead of double-clicking the file. The status line at the top of the
+page tells you whether starring is live ("stars save to disk") or you're
+looking at a read-only snapshot (opened via `file://`, or the server
+isn't running). Stop the server with Ctrl+C when you're done -- it's a
+small stdlib-only script (no new dependency, no database), meant to run
+only while you're actively reviewing the dashboard.
+
+Stars persist in `data/hunting_state.json` and survive both a plain
+browser refresh (the page re-fetches live state from the server) and the
+next scan run regenerating the dashboard (a read-only snapshot is always
+embedded in the freshly generated file too). That file isn't touched by
+`.gitignore`, so if you want a star made locally to show up the next time
+the scheduled GitHub Actions run regenerates the dashboard, commit and
+push it yourself (`git add data/hunting_state.json`) -- there's no
+automatic sync between your machine and the cloud run yet.
+
+Hunting today is intentionally just: starred, when you starred it, your
+own notes, and an optional target-offer price shown next to (never
+replacing) the scanner's own computed max buy price. Purchased/Sold
+stages, price-drop tracking, and notifications build on this same record
+later but aren't implemented yet.
+
 ## Reading the report
 
 - `data_basis` — "Real price + condition" (Turners) vs "Listing language
