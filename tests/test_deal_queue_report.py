@@ -9,6 +9,7 @@ import unittest
 
 from scanner.deal_queue_report import (
     DEFAULT_OUTPUT_PATH,
+    load_bankroll_config,
     load_latest_discovery_payload,
     load_latest_legacy_scan_payload,
     render_latest_deal_queue,
@@ -486,6 +487,287 @@ class TestRenderLatestDealQueueWithLegacyData(unittest.TestCase):
             html = f.read()
         legacy_embedded = self._extract_script_json(html, "legacy-scan-data")
         self.assertEqual(legacy_embedded["rows"][0]["title"], "Item")
+
+
+class TestLoadBankrollConfig(unittest.TestCase):
+    """Covers the Command Centre's one new data source: config.json's
+    static bankroll reference figures. Must stay read-only and must never
+    fabricate a value when the real numbers aren't there."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.config_path = os.path.join(self.tmpdir.name, "config.json")
+
+    def _write_config(self, data):
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def test_returns_none_when_file_missing(self):
+        self.assertIsNone(load_bankroll_config(config_path=self.config_path))
+
+    def test_returns_none_when_corrupt(self):
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertIsNone(load_bankroll_config(config_path=self.config_path))
+
+    def test_returns_none_when_no_bankroll_key(self):
+        self._write_config({"sites": {"thorntons": True}})
+        self.assertIsNone(load_bankroll_config(config_path=self.config_path))
+
+    def test_returns_starting_and_target_when_present(self):
+        self._write_config({"bankroll": {
+            "starting_bankroll": 500, "target_bankroll": 10000,
+            "minimum_profit": 10, "minimum_roi_percent": 40,
+        }})
+        result = load_bankroll_config(config_path=self.config_path)
+        self.assertEqual(result, {"starting_bankroll": 500, "target_bankroll": 10000})
+
+    def test_never_exposes_fields_this_codebase_does_not_track(self):
+        # Regression guard: available_cash/inventory_value/realised_profit
+        # must never appear in the returned dict, even if some future
+        # config.json edit adds them under "bankroll" -- nothing in the
+        # codebase computes/persists those yet (see PROJECT_STATE.md), so
+        # surfacing them here would be inventing a number.
+        self._write_config({"bankroll": {
+            "starting_bankroll": 500, "target_bankroll": 10000,
+            "available_cash": 999, "inventory_value": 111, "realised_profit": 222,
+        }})
+        result = load_bankroll_config(config_path=self.config_path)
+        self.assertEqual(set(result.keys()), {"starting_bankroll", "target_bankroll"})
+
+
+class TestRenderLatestDealQueueBankroll(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.index_path = os.path.join(self.tmpdir.name, "discovery_index.json")
+        self.output_path = os.path.join(self.tmpdir.name, "deal_queue.html")
+
+    def _persist_run(self, opportunities, **meta_overrides):
+        meta = {
+            "run_timestamp": "2026-08-19T09:00:00+00:00", "mode": "discover", "queries_run": 15,
+            "candidates_found": 5, "candidates_verified": 3, "candidates_verification_dropped": 2,
+            "opportunity_count": len(opportunities), "decision_counts": {},
+        }
+        meta.update(meta_overrides)
+        path, payload = write_discovery_report(opportunities, meta, reports_dir=self.tmpdir.name)
+        update_discovery_index(path, payload, index_path=self.index_path)
+        return payload
+
+    def _extract_script_json(self, html, element_id):
+        start_marker = f'<script id="{element_id}" type="application/json">'
+        end_marker = "</script>"
+        start = html.index(start_marker) + len(start_marker)
+        end = html.index(end_marker, start)
+        return json.loads(html[start:end])
+
+    def test_bankroll_embedded_when_config_path_given(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        config_path = os.path.join(self.tmpdir.name, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"bankroll": {"starting_bankroll": 500, "target_bankroll": 10000}}, f)
+
+        render_latest_deal_queue(
+            index_path=self.index_path, reports_dir=self.tmpdir.name,
+            output_path=self.output_path, config_path=config_path,
+        )
+        with open(self.output_path, encoding="utf-8") as f:
+            html = f.read()
+        bankroll_embedded = self._extract_script_json(html, "bankroll-data")
+        self.assertEqual(bankroll_embedded, {"starting_bankroll": 500, "target_bankroll": 10000})
+
+    def test_default_config_path_does_not_leak_real_repo_config(self):
+        # Regression guard mirroring the existing legacy_index_path
+        # protection: when the caller only overrides reports_dir (as
+        # main.py effectively does via the real reports/ directory, and
+        # as every isolated test here does), the bankroll default must be
+        # derived from that reports_dir, not fall back to a fixed
+        # real-repo config.json path.
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        render_latest_deal_queue(
+            index_path=self.index_path, reports_dir=self.tmpdir.name, output_path=self.output_path,
+        )
+        with open(self.output_path, encoding="utf-8") as f:
+            html = f.read()
+        bankroll_embedded = self._extract_script_json(html, "bankroll-data")
+        self.assertIsNone(bankroll_embedded)
+
+
+class TestCommandCentreMarkup(unittest.TestCase):
+    """Covers the new Command Centre presentation layer added on top of
+    the existing Deal Queue. These are static-HTML/JS-source regression
+    guards (matching this file's existing style) rather than a headless
+    browser run -- they lock in that the required structural pieces and
+    architectural guardrails stay in the generated source."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.index_path = os.path.join(self.tmpdir.name, "discovery_index.json")
+        self.output_path = os.path.join(self.tmpdir.name, "deal_queue.html")
+
+    def _persist_run(self, opportunities, **meta_overrides):
+        meta = {
+            "run_timestamp": "2026-08-19T09:00:00+00:00", "mode": "discover", "queries_run": 15,
+            "candidates_found": 5, "candidates_verified": 3, "candidates_verification_dropped": 2,
+            "opportunity_count": len(opportunities), "decision_counts": {},
+        }
+        meta.update(meta_overrides)
+        path, payload = write_discovery_report(opportunities, meta, reports_dir=self.tmpdir.name)
+        update_discovery_index(path, payload, index_path=self.index_path)
+        return payload
+
+    def _render(self):
+        render_latest_deal_queue(
+            index_path=self.index_path, reports_dir=self.tmpdir.name, output_path=self.output_path,
+        )
+        with open(self.output_path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_command_centre_header_and_sections_present(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn("Hello Rhys", html)
+        self.assertIn('id="metrics-row"', html)
+        self.assertIn('id="top-grid"', html)
+        self.assertIn('id="browse-grid"', html)
+        self.assertIn('id="all-opportunities-heading"', html)
+
+    def test_top_opportunities_reuse_existing_tier_ranking_not_a_new_model(self):
+        # Architectural rule: the Command Centre must not introduce a
+        # second valuation/scoring/confidence model. Top opportunities
+        # must be computed from the same sortTier/nativeScoreForSort the
+        # original list already used.
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn("function byTierThenScore(a, b) {", html)
+        self.assertIn("var ta = sortTier(a), tb = sortTier(b);", html)
+        self.assertIn("return nativeScoreForSort(b) - nativeScoreForSort(a);", html)
+        self.assertIn("function computeTopPicks() {", html)
+
+    def test_top_opportunities_does_not_pad_with_legacy_items_to_fill_the_panel(self):
+        # Curation rule from the visual QA pass: BUY/CAPITAL RISK/verified
+        # WATCH items are decision-graded and are never capped away, but
+        # daily-scan (legacy) items -- a plain 1-10 score with no
+        # BUY/WATCH gate behind it -- must never be used as filler just to
+        # reach a round panel size. At most LEGACY_TOP_FILL_CAP (3) of the
+        # strongest ones are added for context, only after every
+        # decision-graded item is already included, and only if that still
+        # leaves room.
+        self._persist_run([_opportunity(decision="WATCH", url="https://www.turners.co.nz/w1")], decision_counts={"WATCH": 1})
+        html = self._render()
+        self.assertIn("var LEGACY_TOP_FILL_CAP = 3;", html)
+        self.assertIn(
+            "var legacyFillCount = Math.min(LEGACY_TOP_FILL_CAP, Math.max(0, MAX_TOP_PICKS - picks.length), legacyRanked.length);",
+            html,
+        )
+        # The explanatory caption element must exist so a user can see
+        # *why* the panel stopped short instead of assuming items are
+        # missing -- and it must say nothing is hidden.
+        self.assertIn('id="top-cap-note"', html)
+        self.assertIn("Nothing is hidden: the rest are in All opportunities below.", html)
+
+    def test_no_buy_banner_logic_present(self):
+        # Requirement: if there are no BUY opportunities, say so explicitly
+        # rather than presenting WATCH items as if they were buys.
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        html = self._render()
+        self.assertIn("No BUY-tier opportunities right now", html)
+        self.assertIn("if (buyCount === 0) {", html)
+
+    def test_sort_control_reuses_existing_persisted_fields(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        # The sort <select> and its options are built client-side at
+        # runtime (like every other filter control), so the static file
+        # contains the JS source that constructs it, not the rendered
+        # <select> markup itself.
+        self.assertIn("selectHtml('f-sort',", html)
+        self.assertIn("document.getElementById('f-sort').addEventListener('change',", html)
+        # profitForSort/roiForFilter/confidence read only fields the
+        # payload already contains -- no new field is invented for sorting.
+        self.assertIn("function profitForSort(it) {", html)
+        self.assertIn("it.raw.expected_net_profit_low", html)
+        self.assertIn("it.raw.potential_profit_nzd", html)
+
+    def test_asking_and_max_buy_labelled_distinctly_and_target_offer_not_invented(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn('<span class="price-label">Asking</span>', html)
+        self.assertIn('<span class="price-label">Max buy</span>', html)
+        # No fabricated "Target offer" field/value anywhere -- the schema
+        # has no authoritative target-offer figure today.
+        self.assertNotIn("Target offer", html)
+
+    def test_zero_opportunity_run_still_renders_command_centre_sections(self):
+        self._persist_run([], decision_counts={})
+        html = self._render()
+        self.assertIn('id="metrics-row"', html)
+        self.assertIn('id="top-grid"', html)
+        self.assertIn('id="browse-grid"', html)
+
+    def test_metric_tiles_use_dedicated_classes_not_shared_pill_badges(self):
+        # Regression guard for the visual-QA bug: metric tiles must not
+        # reuse .pill-buy/.pill-watch/.pill-pass/.pill-legacy (those carry
+        # a background-color rule for the small rounded status badges
+        # elsewhere on the page; reusing the class name leaked that
+        # background onto the tiles as an unintended colored band).
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn("metricTile('BUY', buy, 'metric-value-buy')", html)
+        self.assertIn("metricTile('WATCH', watch, 'metric-value-watch'", html)
+        self.assertIn("metricTile('PASS', pass, 'metric-value-pass')", html)
+        self.assertIn("metricTile('DAILY SCAN ITEMS', legacyRows.length, 'metric-value-legacy'", html)
+        self.assertNotIn("metricTile('BUY', buy, 'pill-buy')", html)
+        self.assertNotIn(".metric-value.pill-buy", html)
+        # Grid layout (not flex) so tiles in the same row are guaranteed
+        # equal height regardless of how long each tile's note text is.
+        self.assertIn(".metrics-row { display: grid;", html)
+
+    def test_header_no_longer_duplicates_decision_counts(self):
+        # Regression guard: the dark header must only show run-freshness
+        # info now -- the BUY/WATCH/PASS/etc counts live in exactly one
+        # place (the metric tiles), not repeated in the header too.
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn("Discovery updated <b>", html)
+        self.assertIn("Daily scan updated <b>", html)
+        self.assertNotIn("' opportunities &middot; ' + counts", html)
+        self.assertNotIn("unverified-source WATCH (unpriced)", html)
+
+    def test_confidence_chip_present_for_discovery_only_and_no_placeholder(self):
+        # Requirement: confidence must be glanceable on the card face when
+        # authoritative (Discovery items only), and must render nothing --
+        # not a "Not available" placeholder -- when it isn't.
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn("function confidenceGlance(it) {", html)
+        self.assertIn("if (isUnsupported(it)) return '';", html)
+        self.assertIn("if (c === null || c === undefined || c === '') return '';", html)
+        self.assertIn("return '<span class=\"confidence-chip\">' + Math.round(n) + '% confidence</span>';", html)
+        # Wired in next to the native score on every row, discovery or legacy.
+        self.assertIn("'<span class=\"score\">' + nativeScoreLine(it) + '</span>' +\n      confidenceGlance(it) +", html)
+        # confidence() itself already returns null for legacy items
+        # (no confidence field in that schema at all) -- confidenceGlance
+        # relies on that rather than adding a second "is legacy" check.
+        self.assertIn("function confidence(it) {\n    if (it.pipeline === 'discovery') return (it.raw.valuation || {}).confidence_pct;\n    return null;\n  }", html)
+
+    def test_confidence_gated_on_verification_not_just_on_a_number_present(self):
+        # Regression guard found during visual QA: an unverified-source
+        # item's confidence_pct is just ResaleValuation's 0.0 dataclass
+        # default (valuation is never attempted for these -- see
+        # scanner.models.Opportunity.verification_status) -- not a real
+        # assessment. Showing "0% confidence" there would misrepresent
+        # "never checked" as "checked and it's worthless", so the chip
+        # must be gated on verification status, not merely on whether
+        # confidence_pct is non-null.
+        o = _opportunity(decision="WATCH")
+        o.verification_status = "unsupported"
+        o.valuation.confidence_pct = 0.0
+        self._persist_run([o], decision_counts={"WATCH": 1})
+        html = self._render()
+        self.assertIn("if (isUnsupported(it)) return '';", html)
 
 
 if __name__ == "__main__":
