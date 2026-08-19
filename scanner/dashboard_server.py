@@ -181,6 +181,27 @@ class HuntingRequestHandler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter, clearly-tagged logging
         print("[dashboard_server]", fmt % args)
 
+    def end_headers(self):
+        # Every response this server sends -- reports/deal_queue.html
+        # (regenerated in place by main.py's --mode discover on each scan,
+        # see scanner/deal_queue_report.py::render_latest_deal_queue()) and
+        # the JSON status/state endpoints alike -- must never be served
+        # from a browser's HTTP cache. deal_queue.html carries no explicit
+        # caching directive by default (SimpleHTTPRequestHandler only sends
+        # Last-Modified), so a browser is free to apply heuristic freshness
+        # caching and serve a stale copy on a later fetch of the same URL
+        # (a second tab, a back/forward navigation, or a backgrounded tab
+        # being silently reloaded) without any network round-trip at all --
+        # which is exactly how a freshly-regenerated Deal Queue view could
+        # appear correctly once and then revert to a prior run's results.
+        # The two live fetch()s in deal_queue_report.py's own JS already
+        # pass {cache: 'no-store'} defensively for this same reason; this
+        # closes the same gap at the source for the document itself (and
+        # every other route this handler serves), where no such per-request
+        # control is possible.
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def _send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)

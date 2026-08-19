@@ -961,6 +961,23 @@ class TestRunScanMarkup(unittest.TestCase):
         self.assertNotIn("%'", scan_js[:6000])
         self.assertNotIn("progress-bar", scan_js[:6000])
 
+    def test_elapsed_ticker_anchors_on_started_at_not_reset_every_poll(self):
+        # Regression guard: the ticking "Elapsed: Xm YYs" display must be
+        # anchored on the backend's started_at (fixed for the life of one
+        # scan), not re-anchored to data.elapsed_seconds on every ~1s poll.
+        # elapsed_seconds only advances when scan_progress.update_progress()
+        # runs, at real pipeline boundaries that can be tens of seconds to
+        # minutes apart on a real scan -- re-anchoring to it every poll (the
+        # previous behaviour) discarded the ticker's own progress each
+        # second and made the clock look frozen/stalled.
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        scan_js = html.split("Run Scan: on-demand discovery scan")[1]
+        self.assertIn("scanStartedAt = data.started_at", scan_js)
+        self.assertIn("function scanElapsedNow()", scan_js)
+        self.assertIn("Date.now() / 1000) - scanStartedAt", scan_js)
+        self.assertNotIn("scanElapsedBase = data.elapsed_seconds", scan_js)
+
     def test_stage_status_glyphs_reflect_real_backend_field_not_invented(self):
         self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
         html = self._render()

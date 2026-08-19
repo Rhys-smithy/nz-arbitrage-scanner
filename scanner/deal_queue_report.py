@@ -1587,9 +1587,25 @@ _HTML_SCRIPT = r"""<script>
   var SCAN_STALL_SECONDS = 60;
   var scanPollTimer = null;
   var scanTickTimer = null;
-  var scanElapsedBase = 0;
-  var scanElapsedBaseAt = 0;
+  // The ticking clock's sole anchor is the backend's started_at (a fixed
+  // wall-clock timestamp, set once per scan by scan_progress.start_progress()
+  // and never touched again). Deliberately NOT data.elapsed_seconds --
+  // that field only advances when scan_progress.update_progress() runs, at
+  // real pipeline boundaries that can legitimately be tens of seconds to
+  // minutes apart on a real scan (see SCAN_STALL_SECONDS above). Anchoring
+  // the display to elapsed_seconds on every ~1s poll (the previous
+  // behaviour) meant each poll snapped the clock back to whatever stale
+  // number the backend last reported, discarding this ticker's own
+  // in-between progress and making the timer look frozen. started_at never
+  // changes mid-scan, so re-reading it every poll is a no-op except when a
+  // genuinely new scan begins.
+  var scanStartedAt = null;
   var scanJustCompleted = false;
+
+  function scanElapsedNow() {
+    if (scanStartedAt == null) return 0;
+    return (Date.now() / 1000) - scanStartedAt;
+  }
 
   function fmtElapsed(totalSeconds) {
     var s = Math.max(0, Math.round(totalSeconds || 0));
@@ -1644,12 +1660,13 @@ _HTML_SCRIPT = r"""<script>
     rows.push('<div class="scan-stage-row">' + scanStageGlyph(stageStatus.RESEARCH || 'pending') +
       '<span class="scan-stage-name">SCORING</span><span class="scan-stage-detail"></span></div>');
 
-    scanElapsedBase = data.elapsed_seconds || 0;
-    scanElapsedBaseAt = Date.now();
+    if (typeof data.started_at === 'number') {
+      scanStartedAt = data.started_at;
+    }
 
     var html = '<div class="scan-headline">Scanning for opportunities&hellip;</div>' +
       rows.join('') +
-      '<div class="scan-elapsed" id="scan-elapsed">Elapsed: ' + fmtElapsed(scanElapsedBase) + '</div>';
+      '<div class="scan-elapsed" id="scan-elapsed">Elapsed: ' + fmtElapsed(scanElapsedNow()) + '</div>';
 
     if (data.heartbeat) {
       var staleness = (Date.now() / 1000) - data.heartbeat;
@@ -1701,7 +1718,7 @@ _HTML_SCRIPT = r"""<script>
   function tickScanElapsed() {
     var el = document.getElementById('scan-elapsed');
     if (!el) return;
-    el.textContent = 'Elapsed: ' + fmtElapsed(scanElapsedBase + (Date.now() - scanElapsedBaseAt) / 1000);
+    el.textContent = 'Elapsed: ' + fmtElapsed(scanElapsedNow());
   }
 
   function pollScanStatus() {
@@ -1754,6 +1771,7 @@ _HTML_SCRIPT = r"""<script>
       }
       postJson('/api/scan/start', {}).then(function () {
         scanJustCompleted = false;
+        scanStartedAt = null;
         startScanPolling();
       }).catch(function () {
         // Most likely a 409 (a scan is already running, started from
