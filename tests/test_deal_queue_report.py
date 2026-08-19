@@ -333,6 +333,56 @@ class TestRenderLatestDealQueue(unittest.TestCase):
     def test_default_output_path_matches_reports_dir_convention(self):
         self.assertTrue(DEFAULT_OUTPUT_PATH.endswith(os.path.join("reports", "deal_queue.html")))
 
+    def test_numeric_filters_no_longer_rerender_filter_bar_on_every_keystroke(self):
+        # Regression guard for the filter-focus-loss fix: render() must not
+        # call renderFilters(). renderFilters() replaces every filter
+        # control's DOM node via innerHTML; since render() runs on every
+        # keystroke in the free-text filters (Min price, Max price, Min
+        # ROI/profit %, Min confidence %), calling it there used to destroy
+        # and recreate the very input the user was typing into, dropping
+        # keyboard focus back to <body> and silently swallowing every
+        # keystroke after the first (typing "500" only ever registered as
+        # "5"). renderFilters() must instead run exactly once, up front, so
+        # each control's DOM node -- and the user's focus in it -- persists
+        # for the life of the page.
+        self._persist_run([_opportunity()], decision_counts={"BUY": 1})
+        render_latest_deal_queue(
+            index_path=self.index_path, reports_dir=self.tmpdir.name, output_path=self.output_path,
+        )
+        with open(self.output_path, encoding="utf-8") as f:
+            html = f.read()
+        self.assertNotIn("function render() {\n    renderFilters();", html)
+        self.assertEqual(html.count("renderFilters();"), 1)
+        # The numeric filters must still update state and trigger a
+        # re-render of the results on every keystroke -- only the filter
+        # bar's own DOM must stop being rebuilt.
+        for field_id in ("f-min-price", "f-max-price", "f-min-roi", "f-min-confidence"):
+            self.assertIn(
+                "document.getElementById('%s').addEventListener('input', function () { state." % field_id, html,
+            )
+
+    def test_decision_pass_shows_pass_items_without_show_passed_toggle(self):
+        # Regression guard: selecting Decision = PASS must be a
+        # self-sufficient way to see PASS opportunities. It previously
+        # required the user to also discover and enable the separate
+        # "Show passed" control, since passFilters() suppressed every PASS
+        # item unconditionally whenever showPass was off -- producing "No
+        # opportunities match the current filters." even though PASS items
+        # existed. "Show passed" must still control PASS visibility in
+        # mixed views (All/other-decision).
+        self._persist_run(
+            [_opportunity(decision="BUY"), _opportunity(decision="PASS", url="https://www.turners.co.nz/y")],
+            decision_counts={"BUY": 1, "PASS": 1},
+        )
+        render_latest_deal_queue(
+            index_path=self.index_path, reports_dir=self.tmpdir.name, output_path=self.output_path,
+        )
+        with open(self.output_path, encoding="utf-8") as f:
+            html = f.read()
+        self.assertIn(
+            "if (!state.showPass && state.decision !== 'PASS' && sortTier(it) === TIER.PASS) return false;", html,
+        )
+
 
 class TestRenderLatestDealQueueWithLegacyData(unittest.TestCase):
     """The combined-dashboard behaviour this task adds: both pipelines'

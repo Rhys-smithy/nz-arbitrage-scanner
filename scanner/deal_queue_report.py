@@ -513,7 +513,17 @@ _HTML_SCRIPT = r"""<script>
     document.getElementById('f-min-roi').addEventListener('input', function () { state.minRoi = this.value; render(); });
     document.getElementById('f-min-confidence').addEventListener('input', function () { state.minConfidence = this.value; render(); });
     document.getElementById('f-hide-no-confidence').addEventListener('change', function () { state.hideNoConfidence = this.checked; render(); });
-    document.getElementById('toggle-pass').addEventListener('click', function () { state.showPass = !state.showPass; render(); });
+    var togglePassBtn = document.getElementById('toggle-pass');
+    togglePassBtn.addEventListener('click', function () {
+      state.showPass = !state.showPass;
+      // Update this button's own label/state in place rather than going
+      // through renderFilters() -- renderFilters() rebuilds every filter
+      // control's DOM node, which would steal focus from whichever field
+      // the user is in the middle of using (see render()'s comment below).
+      this.className = state.showPass ? 'active' : '';
+      this.textContent = state.showPass ? 'Hide passed' : 'Show passed';
+      render();
+    });
   }
 
   function renderStatus() {
@@ -533,7 +543,12 @@ _HTML_SCRIPT = r"""<script>
 
   function passFilters(it) {
     if (state.pipeline !== 'all' && it.pipeline !== state.pipeline) return false;
-    if (!state.showPass && sortTier(it) === TIER.PASS) return false;
+    // "Show passed" hides PASS items from mixed views (All/other-decision)
+    // by default, since they've already been rejected -- but explicitly
+    // selecting Decision = PASS is an unambiguous request to see them, so
+    // it must not also require toggling the separate "Show passed"
+    // control the user has no reason to know about.
+    if (!state.showPass && state.decision !== 'PASS' && sortTier(it) === TIER.PASS) return false;
     if (state.decision !== 'all') {
       if (state.decision === 'NONE') { if (it.pipeline !== 'legacy') return false; }
       else if (decision(it) !== state.decision) return false;
@@ -738,8 +753,20 @@ _HTML_SCRIPT = r"""<script>
     return row;
   }
 
+  // render() only redraws the results queue. It deliberately does NOT
+  // call renderFilters() -- renderFilters() replaces every filter
+  // control's DOM node via innerHTML, and render() runs on every
+  // keystroke in the free-text filters (Min price, Max price, Min
+  // ROI/profit %, Min confidence %). Rebuilding the DOM under a focused
+  // input drops keyboard focus back to <body>, silently swallowing the
+  // rest of whatever the user was typing (e.g. "500" would only ever
+  // register as "5"). renderFilters() is called exactly once, below, to
+  // build the controls and wire their listeners; after that, each
+  // control keeps its own DOM node and its own native input/selection
+  // state for the rest of the page's life, so nothing needs to re-render
+  // it. The one exception (the "Show passed" button's label) updates
+  // itself directly in its own click handler above.
   function render() {
-    renderFilters();
     var queue = document.getElementById('queue');
     queue.innerHTML = '';
     var list = sortedItems();
@@ -756,6 +783,7 @@ _HTML_SCRIPT = r"""<script>
   }
 
   renderStatus();
+  renderFilters();
   render();
 })();
 </script>
