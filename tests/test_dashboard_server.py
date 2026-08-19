@@ -212,6 +212,27 @@ class DashboardServerScanEndpointsTest(unittest.TestCase):
         status, body = self._get("/api/scan/status")
         self.assertEqual(body["error"], "Discovery scan failed: a specific real reason")
 
+    def test_responses_are_never_cached_by_the_browser(self):
+        # Regression guard for the Command Centre's "results appear then
+        # revert" bug: with no Cache-Control header (the previous
+        # behaviour), a browser is free to serve a cached, pre-regeneration
+        # copy of deal_queue.html on a later fetch of the same URL -- a
+        # second tab, a back/forward navigation, or a backgrounded tab
+        # being silently reloaded -- with no network round-trip at all,
+        # which looks exactly like freshly-regenerated results reverting to
+        # a prior run's. Every response this server sends, the JSON status
+        # endpoint and the static dashboard file alike, must carry
+        # Cache-Control: no-store so that can never happen.
+        with urllib.request.urlopen(self._url("/api/scan/status"), timeout=5) as r:
+            self.assertEqual(r.headers.get("Cache-Control"), "no-store")
+            r.read()  # drain fully so the server thread doesn't hit a
+            # BrokenPipeError writing to a socket this `with` block already
+            # closed -- harmless to the assertion above, but noisy in test
+            # output otherwise.
+        with urllib.request.urlopen(self._url("/deal_queue.html"), timeout=5) as r:
+            self.assertEqual(r.headers.get("Cache-Control"), "no-store")
+            r.read()
+
     def test_hunting_endpoint_unaffected_by_scan_routing_changes(self):
         # Regression guard: adding the /api/scan/* routes to do_GET/do_POST
         # must not disturb the pre-existing Hunting routes they sit
