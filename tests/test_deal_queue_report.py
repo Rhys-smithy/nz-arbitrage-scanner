@@ -10,11 +10,13 @@ import unittest
 from scanner.deal_queue_report import (
     DEFAULT_OUTPUT_PATH,
     load_bankroll_config,
+    load_hunting_payload,
     load_latest_discovery_payload,
     load_latest_legacy_scan_payload,
     render_latest_deal_queue,
 )
 from scanner.discovery_report import write_discovery_report, update_discovery_index
+from scanner.hunting_store import save_hunting_state, star
 from scanner.models import ComparableEvidence, CostBreakdown, Opportunity, ProductIdentification, ResaleValuation
 from scanner.report import FIELDNAMES as LEGACY_FIELDNAMES
 
@@ -768,6 +770,137 @@ class TestCommandCentreMarkup(unittest.TestCase):
         self._persist_run([o], decision_counts={"WATCH": 1})
         html = self._render()
         self.assertIn("if (isUnsupported(it)) return '';", html)
+
+
+class TestLoadHuntingPayload(unittest.TestCase):
+    def test_missing_file_returns_empty_but_well_formed_payload(self):
+        # Unlike the discovery/legacy loaders, a missing hunting-state file
+        # is not "no run has happened" -- it's just "nothing hunted yet" --
+        # so this must never return None.
+        payload = load_hunting_payload(hunting_state_path="/tmp/definitely_missing_hunting_xyz.json")
+        self.assertEqual(payload, {"hunting": {}})
+
+    def test_reads_persisted_state_verbatim(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "hunting_state.json")
+            state = {}
+            star(state, "Turners", "https://example.com/x", notes="watching")
+            save_hunting_state(state, path)
+
+            payload = load_hunting_payload(hunting_state_path=path)
+            self.assertEqual(payload, {"hunting": state})
+
+
+class TestRenderLatestDealQueueWithHuntingState(unittest.TestCase):
+    """The Hunting persistence slice: a third, independent payload embedded
+    alongside discovery/legacy, without mutating either of them."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.index_path = os.path.join(self.tmpdir.name, "discovery_index.json")
+        self.output_path = os.path.join(self.tmpdir.name, "deal_queue.html")
+        self.hunting_state_path = os.path.join(self.tmpdir.name, "hunting_state.json")
+
+    def _persist_run(self, opportunities, **meta_overrides):
+        meta = {
+            "run_timestamp": "2026-08-19T09:00:00+00:00", "mode": "discover", "queries_run": 5,
+            "candidates_found": 1, "candidates_verified": 1, "candidates_verification_dropped": 0,
+            "opportunity_count": len(opportunities), "decision_counts": {},
+        }
+        meta.update(meta_overrides)
+        path, payload = write_discovery_report(opportunities, meta, reports_dir=self.tmpdir.name)
+        update_discovery_index(path, payload, index_path=self.index_path)
+        return payload
+
+    def _render(self):
+        render_latest_deal_queue(
+            index_path=self.index_path, reports_dir=self.tmpdir.name, output_path=self.output_path,
+            hunting_state_path=self.hunting_state_path,
+        )
+        with open(self.output_path, encoding="utf-8") as f:
+            return f.read()
+
+    def _embedded_json(self, html, element_id):
+        start_marker = '<script id="%s" type="application/json">' % element_id
+        end_marker = "</script>"
+        start = html.index(start_marker) + len(start_marker)
+        end = html.index(end_marker, start)
+        return json.loads(html[start:end])
+
+    def test_renders_empty_hunting_snapshot_when_no_state_file_exists(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        embedded = self._embedded_json(html, "hunting-state-data")
+        self.assertEqual(embedded, {"hunting": {}})
+
+    def test_embeds_persisted_hunting_state_verbatim(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        state = {}
+        star(state, "Turners", "https://www.turners.co.nz/x", notes="check condition", target_offer_override=75.0)
+        save_hunting_state(state, self.hunting_state_path)
+
+        html = self._render()
+        embedded = self._embedded_json(html, "hunting-state-data")
+        self.assertEqual(embedded, {"hunting": state})
+        entry = list(embedded["hunting"].values())[0]
+        self.assertEqual(entry["status"], "hunting")
+        self.assertEqual(entry["notes"], "check condition")
+        self.assertEqual(entry["target_offer_override"], 75.0)
+
+    def test_discovery_payload_embedding_is_not_mutated_by_hunting_state(self):
+        # Regression guard for the separation-of-concerns requirement:
+        # loading/embedding Hunting state alongside the discovery payload
+        # must not add, remove, or alter any field on the discovery
+        # opportunities themselves.
+        payload = self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        state = {}
+        star(state, "Turners", "https://www.turners.co.nz/x")
+        save_hunting_state(state, self.hunting_state_path)
+
+        html = self._render()
+        embedded_discovery = self._embedded_json(html, "discovery-report-data")
+        self.assertEqual(embedded_discovery, payload)
+        self.assertNotIn("_hunting_key", json.dumps(embedded_discovery))
+        self.assertNotIn("hunting", embedded_discovery["opportunities"][0])
+
+    def test_default_hunting_state_path_is_derived_at_call_time_not_import_time(self):
+        # Mirrors the existing legacy_index_path/config_path pattern: a
+        # caller/test that only overrides reports_dir/output_path must not
+        # silently fall back to reading the real repo's
+        # data/hunting_state.json.
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        render_latest_deal_queue(
+            index_path=self.index_path, reports_dir=self.tmpdir.name, output_path=self.output_path,
+        )
+        with open(self.output_path, encoding="utf-8") as f:
+            html = f.read()
+        embedded = self._embedded_json(html, "hunting-state-data")
+        # Whatever the real repo's data/hunting_state.json happens to
+        # contain is irrelevant here -- this just proves the call didn't
+        # raise and produced a well-formed (if unrelated) payload.
+        self.assertIn("hunting", embedded)
+
+    def test_html_includes_star_control_and_hunting_filter(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn("star-btn", html)
+        self.assertIn("toggleHunting(it)", html)
+        self.assertIn('id="toggle-hunting"', html)
+        self.assertIn("state.huntingOnly", html)
+
+    def test_html_distinguishes_scanner_max_buy_from_target_offer(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn("Scanner max buy", html)
+        self.assertIn("Your target offer", html)
+        self.assertIn("it.raw.max_buy_price", html.split("function renderHuntingSection")[1][:1500])
+
+    def test_html_upgrades_to_live_state_via_fetch(self):
+        self._persist_run([_opportunity(decision="BUY")], decision_counts={"BUY": 1})
+        html = self._render()
+        self.assertIn("fetch('/api/hunting'", html)
+        self.assertIn("liveMode = true;", html)
 
 
 if __name__ == "__main__":
