@@ -537,6 +537,31 @@ main { max-width: 1180px; margin: 0 auto; padding: 18px 16px 60px; }
 .hunting-section input[type=number], .hunting-section textarea { font: inherit; font-size: 12.5px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; width: 100%; box-sizing: border-box; }
 .hunting-section textarea { min-height: 54px; resize: vertical; }
 .hunting-section .hunting-row { display: flex; gap: 10px; align-items: flex-start; margin-top: 6px; flex-wrap: wrap; }
+/* Run Scan: compact, always-visible control + inline live-progress panel
+   for the on-demand discovery scan (scanner/dashboard_server.py's
+   POST /api/scan/start + GET /api/scan/status). Deliberately not a modal
+   -- a stage checklist that sits in the flow of the Command Centre it's
+   already part of, matching the note/live-hunting-note pattern used
+   elsewhere on this page rather than introducing a new visual language. */
+.scan-panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; margin: 4px 0 18px; display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.scan-run-btn { font-size: 12.5px; font-weight: 700; letter-spacing: .03em; padding: 9px 18px; border-radius: 8px; border: none; background: var(--accent); color: #fff; cursor: pointer; white-space: nowrap; }
+.scan-run-btn:hover { background: #1d4ed8; }
+.scan-run-btn:disabled { background: var(--mutedest); cursor: default; }
+.scan-status { font-size: 12.5px; color: var(--text); flex: 1 1 320px; min-width: 240px; }
+.scan-status .scan-headline { font-weight: 700; margin-bottom: 4px; }
+.scan-stage-row { display: flex; align-items: baseline; gap: 8px; padding: 1px 0; }
+.scan-stage-glyph { width: 14px; display: inline-block; text-align: center; font-weight: 700; }
+.scan-stage-glyph.done { color: var(--buy); }
+.scan-stage-glyph.active { color: var(--accent); }
+.scan-stage-glyph.pending { color: var(--mutedest); }
+.scan-stage-name { font-weight: 700; width: 78px; display: inline-block; letter-spacing: .03em; font-size: 11.5px; }
+.scan-stage-detail { color: var(--muted); }
+.scan-elapsed { color: var(--muted); margin-top: 4px; }
+.scan-note { color: var(--mutedest); font-size: 11.5px; margin-top: 2px; }
+.scan-note.scan-error { color: #b91c1c; }
+.scan-note.scan-stalled { color: var(--warn); }
+.scan-note.scan-offline { color: var(--mutedest); }
+
 .hunting-section .hunting-field { flex: 1 1 200px; min-width: 160px; }
 .hunting-section .hunting-field label { display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--mutedest); margin-bottom: 3px; }
 .hunting-section button.save-btn { font-size: 12px; padding: 6px 12px; border: 1px solid var(--accent); color: var(--accent); background: #fff; border-radius: 6px; cursor: pointer; margin-top: 4px; }
@@ -560,6 +585,10 @@ _HTML_BODY_START = """<body>
 </header>
 <main>
   <section class="command-centre" id="command-centre">
+    <div class="scan-panel" id="scan-panel">
+      <button id="scan-run-btn" class="scan-run-btn" type="button">RUN SCAN</button>
+      <div id="scan-status" class="scan-status" style="display:none;"></div>
+    </div>
     <div class="metrics-row" id="metrics-row"></div>
 
     <div class="section-block">
@@ -1541,6 +1570,215 @@ _HTML_SCRIPT = r"""<script>
     liveMode = false;
     refreshHuntingLiveNote();
   });
+
+  // ---- Run Scan: on-demand discovery scan + live progress -------------
+  // Talks to scanner/dashboard_server.py's POST /api/scan/start and
+  // GET /api/scan/status (backed by scanner/scan_progress.py). Requires
+  // the same local server Hunting's live mode above depends on -- there
+  // is nothing else this button could start a scan on. Polls status
+  // roughly once a second while a scan is running (never faster), and
+  // never invents a percentage: only stage checkmarks/dots and the real
+  // item-level counts the status payload actually carries are shown.
+  var SCAN_POLL_MS = 1000;
+  // Generous on purpose: the Turners catalog scrape alone can legitimately
+  // run 30-40s between progress updates early in a run (see
+  // scanner/discover.py's SEARCH-stage instrumentation) -- one slow
+  // network call must never be shown as a stall.
+  var SCAN_STALL_SECONDS = 60;
+  var scanPollTimer = null;
+  var scanTickTimer = null;
+  var scanElapsedBase = 0;
+  var scanElapsedBaseAt = 0;
+  var scanJustCompleted = false;
+
+  function fmtElapsed(totalSeconds) {
+    var s = Math.max(0, Math.round(totalSeconds || 0));
+    var m = Math.floor(s / 60);
+    var r = s % 60;
+    return m + 'm ' + (r < 10 ? '0' : '') + r + 's';
+  }
+
+  function scanStageGlyph(status) {
+    if (status === 'done') return '<span class="scan-stage-glyph done">&#10003;</span>';
+    if (status === 'active') return '<span class="scan-stage-glyph active">&#9679;</span>';
+    return '<span class="scan-stage-glyph pending">&#9675;</span>';
+  }
+
+  function scanStageDetail(stageName, data) {
+    if (stageName === 'SEARCH') {
+      var parts = [];
+      if (data.queries_total) parts.push(data.queries_completed + ' / ' + data.queries_total + ' queries');
+      if (data.raw_results) parts.push(data.raw_results + ' raw');
+      if (data.unique_results) parts.push(data.unique_results + ' unique');
+      return parts.join(' &middot; ');
+    }
+    if (stageName === 'VALIDATION') {
+      if (!data.candidates) return '';
+      return data.verified + ' verified / ' + data.candidates + ' candidates';
+    }
+    if (stageName === 'RESEARCH') {
+      var parts2 = [];
+      if (data.research_total) parts2.push(data.research_completed + ' / ' + data.research_total + ' items');
+      var counts = data.decision_counts || {};
+      ['BUY', 'WATCH', 'PASS', 'PROFITABLE BUT CAPITAL RISK'].forEach(function (d) {
+        if (counts[d]) parts2.push(counts[d] + ' ' + d);
+      });
+      return parts2.join(' &middot; ');
+    }
+    return '';
+  }
+
+  function renderScanRunning(data) {
+    var statusEl = document.getElementById('scan-status');
+    var stageStatus = data.stage_status || {};
+    var rows = ['SEARCH', 'VALIDATION', 'RESEARCH'].map(function (s) {
+      return '<div class="scan-stage-row">' + scanStageGlyph(stageStatus[s] || 'pending') +
+        '<span class="scan-stage-name">' + s + '</span>' +
+        '<span class="scan-stage-detail">' + scanStageDetail(s, data) + '</span></div>';
+    });
+    // SCORING has no backend telemetry of its own -- scoring is
+    // deterministic Python that runs as part of each RESEARCH-stage
+    // candidate, not a separate pass (see scanner/discover.py's module
+    // docstring), so this row is purely a visual echo of RESEARCH's own
+    // status, with no counts invented for it.
+    rows.push('<div class="scan-stage-row">' + scanStageGlyph(stageStatus.RESEARCH || 'pending') +
+      '<span class="scan-stage-name">SCORING</span><span class="scan-stage-detail"></span></div>');
+
+    scanElapsedBase = data.elapsed_seconds || 0;
+    scanElapsedBaseAt = Date.now();
+
+    var html = '<div class="scan-headline">Scanning for opportunities&hellip;</div>' +
+      rows.join('') +
+      '<div class="scan-elapsed" id="scan-elapsed">Elapsed: ' + fmtElapsed(scanElapsedBase) + '</div>';
+
+    if (data.heartbeat) {
+      var staleness = (Date.now() / 1000) - data.heartbeat;
+      if (staleness > SCAN_STALL_SECONDS) {
+        html += '<div class="scan-note scan-stalled">Scan may have stalled -- no update in ' + Math.round(staleness) + 's.</div>';
+      }
+    }
+
+    statusEl.innerHTML = html;
+    statusEl.style.display = '';
+  }
+
+  function renderScanComplete(data) {
+    var statusEl = document.getElementById('scan-status');
+    var counts = data.decision_counts || {};
+    var summary = ['BUY', 'WATCH', 'PROFITABLE BUT CAPITAL RISK', 'PASS']
+      .filter(function (d) { return counts[d]; })
+      .map(function (d) { return counts[d] + ' ' + d; }).join(' &middot; ');
+    statusEl.innerHTML =
+      '<div class="scan-headline">SCAN COMPLETE</div>' +
+      '<div class="scan-stage-detail">' + (summary || 'No opportunities found this run.') + '</div>' +
+      '<div class="scan-elapsed">Completed in ' + fmtElapsed(data.elapsed_seconds) + '</div>';
+    statusEl.style.display = '';
+  }
+
+  function renderScanFailed(data) {
+    var statusEl = document.getElementById('scan-status');
+    statusEl.innerHTML =
+      '<div class="scan-headline">SCAN FAILED</div>' +
+      '<div class="scan-note scan-error">' + escapeHtml(data.error || 'Unknown error.') + '</div>' +
+      '<div class="scan-elapsed">Stopped after ' + fmtElapsed(data.elapsed_seconds) + '</div>';
+    statusEl.style.display = '';
+  }
+
+  function setScanButtonRunning(running) {
+    var btn = document.getElementById('scan-run-btn');
+    btn.disabled = running;
+    btn.textContent = running ? 'SCAN RUNNING…' : 'RUN SCAN';
+  }
+
+  function stopScanPolling() {
+    if (scanPollTimer) { clearInterval(scanPollTimer); scanPollTimer = null; }
+    if (scanTickTimer) { clearInterval(scanTickTimer); scanTickTimer = null; }
+  }
+
+  // Ticks the displayed elapsed time between polls without hitting the
+  // server again -- keeps the clock feeling alive at ~4fps while the
+  // actual network poll stays at SCAN_POLL_MS (see startScanPolling()).
+  function tickScanElapsed() {
+    var el = document.getElementById('scan-elapsed');
+    if (!el) return;
+    el.textContent = 'Elapsed: ' + fmtElapsed(scanElapsedBase + (Date.now() - scanElapsedBaseAt) / 1000);
+  }
+
+  function pollScanStatus() {
+    fetch('/api/scan/status', { cache: 'no-store' }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (data) {
+      if (data.running) {
+        setScanButtonRunning(true);
+        renderScanRunning(data);
+        return;
+      }
+      stopScanPolling();
+      setScanButtonRunning(false);
+      if (data.stage === 'COMPLETE') {
+        renderScanComplete(data);
+        if (!scanJustCompleted) {
+          scanJustCompleted = true;
+          // A brief pause so "SCAN COMPLETE" is actually readable before
+          // reloading to pick up the regenerated deal_queue.html (new
+          // discovery data + the current data/hunting_state.json snapshot
+          // -- render_latest_deal_queue() always embeds whatever's
+          // currently on disk there, so Hunting state is never at risk
+          // across this reload).
+          setTimeout(function () { window.location.reload(); }, 1800);
+        }
+      } else if (data.stage === 'FAILED') {
+        renderScanFailed(data);
+      }
+    }).catch(function () {
+      stopScanPolling();
+      setScanButtonRunning(false);
+    });
+  }
+
+  function startScanPolling() {
+    if (scanPollTimer) return;
+    pollScanStatus();
+    scanPollTimer = setInterval(pollScanStatus, SCAN_POLL_MS);
+    scanTickTimer = setInterval(tickScanElapsed, 250);
+  }
+
+  function initScanPanel() {
+    document.getElementById('scan-run-btn').addEventListener('click', function () {
+      if (!liveMode) {
+        var statusEl = document.getElementById('scan-status');
+        statusEl.innerHTML = '<div class="scan-note scan-offline">Run Scan needs the local dashboard server running -- see README ("python -m scanner.dashboard_server"), then reload this page.</div>';
+        statusEl.style.display = '';
+        return;
+      }
+      postJson('/api/scan/start', {}).then(function () {
+        scanJustCompleted = false;
+        startScanPolling();
+      }).catch(function () {
+        // Most likely a 409 (a scan is already running, started from
+        // another tab or a previous click) -- that's still real progress
+        // to show, not a dead end, so poll immediately rather than
+        // leaving the button in a stuck-looking state.
+        var statusEl = document.getElementById('scan-status');
+        statusEl.innerHTML = '<div class="scan-note">Scan already running -- showing live progress.</div>';
+        statusEl.style.display = '';
+        startScanPolling();
+      });
+    });
+
+    // A scan may already be running when this page loads (started from
+    // another tab, or this page was reloaded mid-scan) -- check once so
+    // that state isn't lost, mirroring the Hunting live-upgrade fetch above.
+    fetch('/api/scan/status', { cache: 'no-store' }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (data) {
+      if (data.running) startScanPolling();
+    }).catch(function () { /* server not reachable -- leave the idle button as-is */ });
+  }
+
+  initScanPanel();
 })();
 </script>
 """

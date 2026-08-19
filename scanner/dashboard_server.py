@@ -22,6 +22,19 @@ you're done. It does exactly two jobs:
    time. This process is the only thing that ever writes
    ``data/hunting_state.json``.
 
+It also owns the Command Centre's "Run Scan" on-demand-scan workflow, for
+the same reason: a click needs somewhere to start a scan and somewhere to
+poll live progress from, and this is already the one long-lived local
+process for exactly that kind of thing. POST /api/scan/start spawns
+``python main.py --mode discover`` as its own OS subprocess (never inside
+the request-handling thread -- a discovery scan takes minutes, and this
+server must keep answering every other request the whole time) and
+rejects a second concurrent start with 409. GET /api/scan/status reads
+back whatever ``scanner/scan_progress.py`` -- written to by the scan
+subprocess itself, not by this server -- currently has in
+``data/scan_progress.json``. This server never computes scan progress
+itself, only relays it.
+
 Nothing here touches scanner opportunity data: no discovery_*.json, no
 opportunities_*.csv/xlsx, no config.json is ever read or written by this
 module.
@@ -49,6 +62,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
@@ -63,9 +78,85 @@ from scanner.hunting_store import (
     update_notes,
     update_target_offer,
 )
+from scanner import scan_progress
 
 REPORTS_DIR = os.path.join(os.path.dirname(__file__), "..", "reports")
+REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 DEFAULT_PORT = 8765
+
+# ---------------------------------------------------------------------------
+# On-demand scan ("Run Scan" in the Command Centre).
+#
+# The scan itself (python main.py --mode discover) is a completely separate
+# OS process from this HTTP server -- it must be, since a single discovery
+# scan takes minutes and this server has to keep answering GET /api/hunting
+# and GET /api/scan/status requests the whole time. `_scan_process` /
+# `_scan_lock` below track at most one such subprocess; a second
+# POST /api/scan/start while one is already running is rejected with 409
+# rather than ever running two scans concurrently against the same
+# data/discovered.json, data/search_stats.json, and reports/ files.
+# ---------------------------------------------------------------------------
+_scan_lock = threading.Lock()
+_scan_process: Optional[subprocess.Popen] = None
+
+
+def _spawn_scan_process() -> subprocess.Popen:
+    """Starts `python main.py --mode discover` as a detached subprocess.
+    Pulled out as its own function (rather than inlined below) so tests
+    can monkeypatch it with a fake, controllable process object instead of
+    actually spawning a multi-minute discovery scan."""
+    return subprocess.Popen(
+        [sys.executable, "main.py", "--mode", "discover"],
+        cwd=REPO_ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _watch_scan_process(proc: subprocess.Popen) -> None:
+    """Runs in a background daemon thread for the lifetime of one scan.
+    Blocks on proc.wait() (never in the request-handling thread), then:
+
+    1. Clears `_scan_process` so a new scan can be started once this one
+       is truly finished, independent of whether anyone is polling status.
+    2. Reconciles data/scan_progress.json if the subprocess exited non-zero
+       but the progress file still says running=true -- this means
+       main.py's own try/except (scanner/scan_progress.fail_progress(),
+       see main.py's --mode discover branch) never got a chance to run,
+       e.g. the interpreter crashed outright or was killed. Without this,
+       a hard crash would leave the dashboard showing a scan that looks
+       like it's still running forever.
+    """
+    returncode = proc.wait()
+    global _scan_process
+    with _scan_lock:
+        _scan_process = None
+    if returncode != 0:
+        state = scan_progress.load_progress()
+        if state.get("running"):
+            scan_progress.fail_progress(
+                f"Scan process exited unexpectedly (exit code {returncode})."
+            )
+
+
+def start_scan() -> bool:
+    """Starts a discovery scan if none is currently running.
+
+    Returns True if a new scan was started, False if one was already
+    running (the caller -- do_POST below -- returns 409 in that case).
+    Never blocks on the scan itself: only the (near-instant) subprocess
+    spawn happens under the lock; the actual multi-minute scan runs
+    entirely in the child process, and _watch_scan_process() above runs in
+    its own background thread, not this one.
+    """
+    global _scan_process
+    with _scan_lock:
+        if _scan_process is not None and _scan_process.poll() is None:
+            return False
+        _scan_process = _spawn_scan_process()
+        proc = _scan_process
+    threading.Thread(target=_watch_scan_process, args=(proc,), daemon=True).start()
+    return True
 
 # Serialises every read-modify-write against data/hunting_state.json
 # across request threads (ThreadingHTTPServer spawns one thread per
@@ -117,9 +208,20 @@ class HuntingRequestHandler(SimpleHTTPRequestHandler):
             state = load_hunting_state()
             self._send_json(200, {"hunting": state})
             return
+        if self.path == "/api/scan/status":
+            self._send_json(200, scan_progress.load_progress())
+            return
         super().do_GET()
 
     def do_POST(self):
+        if self.path == "/api/scan/start":
+            started = start_scan()
+            if not started:
+                self._send_json(409, {"error": "Scan already running", "status": scan_progress.load_progress()})
+                return
+            self._send_json(200, {"started": True, "status": scan_progress.load_progress()})
+            return
+
         if self.path not in _API_ROUTES:
             self._send_json(404, {"error": "not found"})
             return

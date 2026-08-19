@@ -1,0 +1,225 @@
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import json
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+from unittest import mock
+
+from scanner import dashboard_server, scan_progress
+
+
+class _FakeProcess:
+    """Stands in for subprocess.Popen in tests -- controllable from the
+    test itself instead of actually spawning `python main.py --mode
+    discover` (a multi-minute discovery scan requiring live network access
+    and API keys neither available nor wanted in a unit test)."""
+
+    def __init__(self):
+        self._done = threading.Event()
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode if self._done.is_set() else None
+
+    def wait(self):
+        self._done.wait(timeout=5)
+        return self.returncode
+
+    def finish(self, returncode=0):
+        self.returncode = returncode
+        self._done.set()
+
+
+class DashboardServerScanEndpointsTest(unittest.TestCase):
+    """Exercises POST /api/scan/start and GET /api/scan/status against a
+    real ThreadingHTTPServer (the same class scanner/dashboard_server.py
+    runs in production), with subprocess spawning mocked out. This is the
+    same style unittest.mock recommends for http.server-based code -- a
+    real server on an ephemeral port, driven over a real socket, rather
+    than trying to unit-test BaseHTTPRequestHandler methods directly
+    (they assume a live request/response cycle)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard_server.HuntingRequestHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def setUp(self):
+        # data/scan_progress.json is real, shared, transient scratch state
+        # (see scanner/scan_progress.py's module docstring) -- back it up
+        # and restore it after each test so these tests never leave a
+        # permanent side effect on the repo, regardless of the fact that
+        # scan_progress's module-level functions bind DEFAULT_PATH at
+        # scan_progress.py's own import time (so per-test temp-path
+        # injection isn't available the way tests/test_hunting_store.py
+        # does it for an explicit `path=` argument).
+        self._real_path = scan_progress.DEFAULT_PATH
+        self._backup = None
+        if os.path.exists(self._real_path):
+            with open(self._real_path, encoding="utf-8") as f:
+                self._backup = f.read()
+            os.remove(self._real_path)
+
+        # Reset dashboard_server's module-level scan-tracking state so
+        # tests never leak a "running" process into one another.
+        dashboard_server._scan_process = None
+
+        self.spawn_patch = mock.patch("scanner.dashboard_server._spawn_scan_process")
+        self.mock_spawn = self.spawn_patch.start()
+        self.addCleanup(self.spawn_patch.stop)
+
+    def tearDown(self):
+        dashboard_server._scan_process = None
+        if os.path.exists(self._real_path):
+            os.remove(self._real_path)
+        if self._backup is not None:
+            with open(self._real_path, "w", encoding="utf-8") as f:
+                f.write(self._backup)
+
+    def _url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def _get(self, path):
+        with urllib.request.urlopen(self._url(path), timeout=5) as r:
+            return r.status, json.loads(r.read())
+
+    def _post(self, path, body=None):
+        data = json.dumps(body or {}).encode("utf-8")
+        req = urllib.request.Request(self._url(path), data=data, method="POST",
+                                      headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_status_when_no_scan_has_ever_run(self):
+        status, body = self._get("/api/scan/status")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["running"])
+        self.assertIsNone(body["stage"])
+
+    def test_status_reflects_real_persisted_progress(self):
+        scan_progress.start_progress(queries_total=7)
+        status, body = self._get("/api/scan/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["running"])
+        self.assertEqual(body["queries_total"], 7)
+        self.assertEqual(body["stage"], "SEARCH")
+
+    def test_start_scan_spawns_process_and_returns_200(self):
+        fake = _FakeProcess()
+        self.mock_spawn.return_value = fake
+
+        status, body = self._post("/api/scan/start")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(body["started"])
+        self.mock_spawn.assert_called_once()
+
+        fake.finish(0)  # let the watcher thread exit cleanly before teardown
+
+    def test_second_start_rejected_with_409_while_running(self):
+        fake = _FakeProcess()
+        self.mock_spawn.return_value = fake
+        status1, _ = self._post("/api/scan/start")
+        self.assertEqual(status1, 200)
+
+        status2, body2 = self._post("/api/scan/start")
+        self.assertEqual(status2, 409)
+        self.assertIn("already running", body2["error"].lower())
+        # Only one subprocess was ever spawned -- the second request must
+        # not have started a second one.
+        self.mock_spawn.assert_called_once()
+
+        fake.finish(0)
+
+    def test_start_succeeds_again_once_previous_scan_finished(self):
+        fake1 = _FakeProcess()
+        self.mock_spawn.return_value = fake1
+        self._post("/api/scan/start")
+        fake1.finish(0)
+
+        # Give the background watcher thread a moment to clear
+        # dashboard_server._scan_process after fake1.wait() returns.
+        for _ in range(50):
+            if dashboard_server._scan_process is None:
+                break
+            time.sleep(0.02)
+
+        fake2 = _FakeProcess()
+        self.mock_spawn.return_value = fake2
+        status, body = self._post("/api/scan/start")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["started"])
+        self.assertEqual(self.mock_spawn.call_count, 2)
+
+        fake2.finish(0)
+
+    def test_crash_before_fail_progress_is_reconciled_as_failed(self):
+        # Simulates main.py's --mode discover branch having called
+        # start_progress() but then the interpreter being killed outright
+        # before its own except-block could call fail_progress() (e.g. a
+        # hard crash, OOM-kill) -- the progress file is left saying
+        # running=true forever unless something else notices the process
+        # actually died.
+        scan_progress.start_progress(queries_total=3)
+        fake = _FakeProcess()
+        self.mock_spawn.return_value = fake
+        self._post("/api/scan/start")
+
+        fake.finish(returncode=1)
+
+        status = None
+        for _ in range(50):
+            status, body = self._get("/api/scan/status")
+            if not body["running"]:
+                break
+            time.sleep(0.02)
+
+        self.assertFalse(body["running"])
+        self.assertEqual(body["stage"], "FAILED")
+        self.assertIn("exit code 1", body["error"])
+
+    def test_crash_reconciliation_does_not_overwrite_an_already_recorded_failure(self):
+        # If main.py's own except-block DID get to call fail_progress()
+        # with a real, specific error before the process exited, the
+        # generic "exited unexpectedly" reconciliation message must never
+        # clobber it.
+        scan_progress.start_progress(queries_total=3)
+        scan_progress.fail_progress("Discovery scan failed: a specific real reason")
+        fake = _FakeProcess()
+        self.mock_spawn.return_value = fake
+        self._post("/api/scan/start")
+
+        fake.finish(returncode=1)
+        time.sleep(0.1)  # let the watcher thread's reconciliation check run
+
+        status, body = self._get("/api/scan/status")
+        self.assertEqual(body["error"], "Discovery scan failed: a specific real reason")
+
+    def test_hunting_endpoint_unaffected_by_scan_routing_changes(self):
+        # Regression guard: adding the /api/scan/* routes to do_GET/do_POST
+        # must not disturb the pre-existing Hunting routes they sit
+        # alongside.
+        status, body = self._get("/api/hunting")
+        self.assertEqual(status, 200)
+        self.assertIn("hunting", body)
+
+
+if __name__ == "__main__":
+    unittest.main()

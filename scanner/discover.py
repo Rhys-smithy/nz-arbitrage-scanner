@@ -28,6 +28,7 @@ from scanner.notifier import build_flip_alert, send_telegram_message
 from scanner.product_id import detect_condition_risk, identify_product
 from scanner.query_generator import allocate_discovery_queries
 from scanner.researcher import research
+from scanner import scan_progress
 from scanner.scrapers.turners_vehicles import DIVISIONS as _TURNERS_VEHICLE_DIVISIONS
 from scanner.search.auction_search import AuctionSearchSource
 from scanner.search.util import canonicalize_url, identify_marketplace, is_individual_listing_url
@@ -317,7 +318,18 @@ def _build_unverified_watch_opportunity(candidate, verified) -> Opportunity:
     )
 
 
-def run_discovery(config: dict) -> list[Opportunity]:
+def run_discovery(config: dict, progress_path: str = scan_progress.DEFAULT_PATH) -> list[Opportunity]:
+    """`progress_path` lets callers (tests, or a future alternate progress
+    file location) redirect where the live SEARCH/VALIDATION/RESEARCH
+    progress updates below are written -- defaults to the real
+    data/scan_progress.json. This function itself does not call
+    scan_progress.start_progress()/complete_progress()/fail_progress():
+    main.py's --mode discover branch owns the overall scan lifecycle
+    (start before calling this, complete only once the Deal Queue view is
+    actually regenerated afterward, fail on any exception) -- see that
+    module for why. This function only reports real progress *within* a
+    run that's already been started.
+    """
     discovery_cfg = config.get("discovery", {})
     if not discovery_cfg.get("enabled", False):
         print("[discover] discovery.enabled is false in config.json -- skipping. "
@@ -382,6 +394,11 @@ def run_discovery(config: dict) -> list[Opportunity]:
         # below doesn't use `queries` at all.
         queries = []
 
+    # SEARCH stage: queries_total is genuinely known now (before either the
+    # Turners scrape or the Tavily loop below has run) -- main.py's
+    # start_progress() call before run_discovery() couldn't know this yet.
+    scan_progress.update_progress({"queries_total": len(queries)}, path=progress_path)
+
     stats = load_stats()
     discovered_store = load_discovered()
     all_results = []
@@ -435,8 +452,15 @@ def run_discovery(config: dict) -> list[Opportunity]:
         f"not_individual_listing={auction_log_entry['rejected_not_individual_listing']}, "
         f"ebay={auction_log_entry['rejected_ebay']})"
     )
+    # Turners direct-scrape isn't one of the counted `queries`, but its
+    # results/dedup count are real and worth showing before the first
+    # Tavily query (if any) even starts -- otherwise SEARCH would report
+    # 0 raw/unique for however long the Turners scrape takes.
+    scan_progress.update_progress(
+        {"raw_results": len(all_results), "unique_results": len(seen_canonical)}, path=progress_path
+    )
 
-    for query in queries:
+    for query_index, query in enumerate(queries, start=1):
         results = web_search.search(query, max_results=max_results, include_domains=discovery_domains)
         concept = extract_concept_from_query(query, concepts)
         # Record every result's discovery under this query's concept for
@@ -454,6 +478,14 @@ def run_discovery(config: dict) -> list[Opportunity]:
             f"rejected(duplicate={log_entry['rejected_duplicate']}, "
             f"not_individual_listing={log_entry['rejected_not_individual_listing']}, "
             f"ebay={log_entry['rejected_ebay']})"
+        )
+        scan_progress.update_progress(
+            {
+                "queries_completed": query_index,
+                "raw_results": len(all_results),
+                "unique_results": len(seen_canonical),
+            },
+            path=progress_path,
         )
 
     # Search snippets rarely carry a structured price field -- best-effort
@@ -481,6 +513,22 @@ def run_discovery(config: dict) -> list[Opportunity]:
     # variable was assigned AFTER the cap below, so "candidates_found" in
     # run_meta was actually a post-cap count wearing a pre-cap name.
     candidates_found = len(candidates)
+
+    # VALIDATION stage begins: SEARCH is genuinely done (the full
+    # deduped/candidate list above is final), candidates_found is the real
+    # funnel size verification is about to work through.
+    scan_progress.update_progress(
+        {
+            "stage": scan_progress.STAGE_VALIDATION,
+            "stage_status": {
+                scan_progress.STAGE_SEARCH: "done",
+                scan_progress.STAGE_VALIDATION: "active",
+                scan_progress.STAGE_RESEARCH: "pending",
+            },
+            "candidates": candidates_found,
+        },
+        path=progress_path,
+    )
 
     # Phase 4B.4: max_research_items only rations the paid AI-research
     # pipeline (identify_product/research_comparables/research/
@@ -532,6 +580,7 @@ def run_discovery(config: dict) -> list[Opportunity]:
         if verified.status == "verified":
             candidate.price = verified.price  # overwrite snippet-derived price with the authoritative one
             verified_candidates.append(candidate)
+            scan_progress.update_progress({"verified": len(verified_candidates)}, path=progress_path)
             continue
         if verified.status == "unsupported":
             # Phase 4B.3: structurally can't be compliantly re-verified
@@ -547,6 +596,11 @@ def run_discovery(config: dict) -> list[Opportunity]:
                 f"[discover]   verification unsupported -> WATCH (unverified): "
                 f"url={candidate.url!r} reason={verified.reason!r}"
             )
+            # `verified` count itself is unchanged here -- this call exists
+            # so the heartbeat/elapsed clock keeps advancing even during a
+            # run of unsupported (Trade Me/Thorntons/Mainland) candidates,
+            # which never touch the "verified" branch above.
+            scan_progress.update_progress({"verified": len(verified_candidates)}, path=progress_path)
             continue
         # status == "unavailable" (or anything else non-"verified"): the
         # source was attempted but no authoritative price/data could be
@@ -557,6 +611,7 @@ def run_discovery(config: dict) -> list[Opportunity]:
             f"[discover]   verification dropped: status={verified.status} "
             f"url={candidate.url!r} reason={verified.reason!r}"
         )
+        scan_progress.update_progress({"verified": len(verified_candidates)}, path=progress_path)
 
     print(
         f"[discover] verification: {len(verified_candidates)} verified, "
@@ -564,6 +619,27 @@ def run_discovery(config: dict) -> list[Opportunity]:
         f"{verification_dropped} dropped (of {len(candidates)} candidates)."
     )
     candidates = verified_candidates
+
+    # RESEARCH stage begins: `candidates` here is its true total for this
+    # run (product ID + comparable research + valuation + costs + scoring
+    # all happen per-candidate below, in one combined pass -- see this
+    # function's own module docstring and scanner/discover.py's design
+    # note in the audit this feature was built from: research and
+    # valuation are NOT separable global stages in this codebase today,
+    # so they are deliberately reported as one "RESEARCH" stage rather
+    # than a fake independent VALUATION stage).
+    scan_progress.update_progress(
+        {
+            "stage": scan_progress.STAGE_RESEARCH,
+            "stage_status": {
+                scan_progress.STAGE_SEARCH: "done",
+                scan_progress.STAGE_VALIDATION: "done",
+                scan_progress.STAGE_RESEARCH: "active",
+            },
+            "research_total": len(candidates),
+        },
+        path=progress_path,
+    )
 
     api_key = config.get("anthropic_api_key", "")
     bankroll_cfg = config.get("bankroll", {})
@@ -632,7 +708,35 @@ def run_discovery(config: dict) -> list[Opportunity]:
 
         opportunities.append(opportunity)
 
+        # RESEARCH stage progress: `opportunities` is exactly the count of
+        # candidates that have been through the full identify -> research
+        # -> value -> score chain so far, and decision_counts is a real,
+        # cheap-to-recompute tally of this run's decisions to date -- not
+        # an estimate.
+        scan_progress.update_progress(
+            {
+                "research_completed": len(opportunities),
+                "decision_counts": dict(Counter(o.decision for o in opportunities)),
+            },
+            path=progress_path,
+        )
+
     save_stats(stats)
+
+    # The per-candidate loop above is genuinely finished -- reflect that
+    # immediately (stage stays RESEARCH; main.py's --mode discover branch
+    # is what later transitions to COMPLETE, once the Deal Queue view has
+    # actually been regenerated from this run's results).
+    scan_progress.update_progress(
+        {
+            "stage_status": {
+                scan_progress.STAGE_SEARCH: "done",
+                scan_progress.STAGE_VALIDATION: "done",
+                scan_progress.STAGE_RESEARCH: "done",
+            },
+        },
+        path=progress_path,
+    )
 
     # Phase 4B.3: append the preserved-but-unverified WATCH opportunities
     # after the scored loop above, not into `candidates`/the loop itself --
