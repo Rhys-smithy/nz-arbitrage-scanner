@@ -50,6 +50,41 @@ did.
 The page is a single static file with inline CSS/JS (no build step, no
 new dependency, no server) so it opens directly via file:// -- consistent
 with how reports/opportunities_*.csv|xlsx already work today.
+
+Hunting (starring) -- a third, independent payload
+---------------------------------------------------
+As of this module's Hunting slice, a third payload is embedded alongside
+the discovery and legacy ones: a read-only snapshot of
+``data/hunting_state.json`` (via ``scanner/hunting_store.py``), which
+holds only user-authored workflow state (starred/notes/target-offer
+override), never scanner-generated data. It is loaded exactly like the
+other two -- read verbatim, never computed or reinterpreted here -- and
+kept in its own script tag so it stays visually and structurally separate
+from scanner output.
+
+The discovery and legacy payloads embedded on the page are untouched by
+this addition -- exactly the same dicts loaded from disk, with nothing
+added, removed, or recomputed (this is asserted directly by
+``tests/test_deal_queue_report.py``'s exact round-trip test). Matching a
+row to its Hunting record is instead done entirely client-side: the
+page's JS mirrors ``scanner.search.util.canonicalize_url()`` well enough
+to compute the same ``source + canonical URL`` key
+``scanner.hunting_store.make_key()`` uses, from each row's own existing
+``source``/``url`` fields, at render time. That JS mirror is documented
+in-line where it's defined and is a client-side approximation only --
+the server (``scanner/dashboard_server.py``) always computes the
+authoritative key itself from the raw ``source``/``url`` a star/unstar
+request sends it, so an edge case where the two disagree could only ever
+affect whether a row's star renders as already-filled, never whether
+starring/unstarring itself works.
+
+Because a star can happen at any moment (not just at scan time), a
+starred item must survive a plain browser refresh, not only the next
+scanner run -- an embedded snapshot alone only updates when this module
+next regenerates the HTML. See ``scanner/dashboard_server.py`` for the
+local process that serves this same JSON live, and this page's own
+client-side JS for how it upgrades from "read the embedded snapshot" to
+"fetch the live state" when that server happens to be running.
 """
 from __future__ import annotations
 
@@ -59,6 +94,8 @@ import os
 from typing import Optional
 
 from scanner.discovery_report import DEFAULT_INDEX_PATH, REPORTS_DIR
+from scanner.hunting_store import DEFAULT_PATH as DEFAULT_HUNTING_STATE_PATH
+from scanner.hunting_store import load_hunting_state
 
 DEFAULT_OUTPUT_PATH = os.path.join(REPORTS_DIR, "deal_queue.html")
 
@@ -248,29 +285,48 @@ def load_bankroll_config(config_path: str = DEFAULT_CONFIG_PATH) -> Optional[dic
     return {"starting_bankroll": starting, "target_bankroll": target}
 
 
+def load_hunting_payload(hunting_state_path: str = DEFAULT_HUNTING_STATE_PATH) -> dict:
+    """Reads data/hunting_state.json via scanner.hunting_store (same
+    missing/corrupt-file -> {} handling as that module) and returns it
+    wrapped as {"hunting": {...}} -- the exact shape
+    scanner/dashboard_server.py's live GET /api/hunting endpoint also
+    returns, so the page's client-side JS has one parsing path for both
+    the embedded snapshot and a live fetch(). Never returns None: an
+    absent/corrupt file is legitimately "nothing hunted yet", not "no run
+    has happened", so unlike the two loaders above this always yields a
+    well-formed (possibly empty) payload rather than None."""
+    return {"hunting": load_hunting_state(hunting_state_path)}
+
+
 def render_latest_deal_queue(
     index_path: str = DEFAULT_INDEX_PATH,
     legacy_index_path: Optional[str] = None,
     reports_dir: str = REPORTS_DIR,
     output_path: str = DEFAULT_OUTPUT_PATH,
     config_path: Optional[str] = None,
+    hunting_state_path: Optional[str] = None,
 ) -> Optional[str]:
     """Loads the latest persisted discovery payload AND the latest
     persisted legacy-scan payload -- independently; neither pipeline's
     data is merged, recomputed, or reinterpreted -- plus the static
-    bankroll reference figures, and writes all three into
-    reports/deal_queue.html (a fixed filename, overwritten every run, so
-    there's always one current view to open -- the timestamped JSON/CSV
-    files remain the historical record).
+    bankroll reference figures and the current Hunting state, and writes
+    all four into reports/deal_queue.html (a fixed filename, overwritten
+    every run, so there's always one current view to open -- the
+    timestamped JSON/CSV files remain the historical record).
 
     `config_path` defaults to `<reports_dir>/../config.json` (computed at
     call time, not import time), mirroring `legacy_index_path`'s
     reports_dir-relative default -- so a caller/test that only overrides
     `reports_dir` still gets an isolated default instead of silently
-    reading the real repo's config.json.
+    reading the real repo's config.json. `hunting_state_path` defaults to
+    scanner.hunting_store.DEFAULT_PATH (data/hunting_state.json) the same
+    way, resolved at call time so test isolation works the same as the
+    other two.
 
     Returns the path written, or None only if NEITHER pipeline has ever
-    produced a persisted run (nothing to show at all)."""
+    produced a persisted run (nothing to show at all) -- Hunting state
+    alone, with no scanner data at all, is never enough to render a page,
+    since there would be nothing for a star to attach to."""
     discovery_payload = load_latest_discovery_payload(index_path=index_path, reports_dir=reports_dir)
     legacy_payload = load_latest_legacy_scan_payload(legacy_index_path=legacy_index_path, reports_dir=reports_dir)
     if discovery_payload is None and legacy_payload is None:
@@ -280,7 +336,15 @@ def render_latest_deal_queue(
         config_path = os.path.join(reports_dir, "..", "config.json")
     bankroll_cfg = load_bankroll_config(config_path=config_path)
 
-    html = _render_html(discovery_payload, legacy_payload, bankroll_cfg)
+    if hunting_state_path is None:
+        hunting_state_path = DEFAULT_HUNTING_STATE_PATH
+    hunting_payload = load_hunting_payload(hunting_state_path=hunting_state_path)
+
+    # discovery_payload/legacy_payload are embedded exactly as loaded --
+    # no copy, no added field, no recomputation. See the module docstring's
+    # "Hunting (starring)" section for how the page matches a row to its
+    # Hunting record without needing this module to touch either payload.
+    html = _render_html(discovery_payload, legacy_payload, bankroll_cfg, hunting_payload)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -303,7 +367,10 @@ def _render_html(
     discovery_payload: Optional[dict],
     legacy_payload: Optional[dict] = None,
     bankroll_cfg: Optional[dict] = None,
+    hunting_payload: Optional[dict] = None,
 ) -> str:
+    if hunting_payload is None:
+        hunting_payload = {"hunting": {}}
     return (
         _HTML_HEAD
         + _HTML_STYLE
@@ -313,6 +380,8 @@ def _render_html(
         + _embed(legacy_payload)
         + _HTML_MID_2
         + _embed(bankroll_cfg)
+        + _HTML_MID_3
+        + _embed(hunting_payload)
         + _HTML_BODY_END
         + _HTML_SCRIPT
         + _HTML_FOOT
@@ -454,6 +523,25 @@ main { max-width: 1180px; margin: 0 auto; padding: 18px 16px 60px; }
 .missing-note { margin-top: 16px; font-size: 11.5px; color: var(--mutedest); border-top: 1px solid var(--border); padding-top: 10px; }
 .empty-run { padding: 30px; text-align: center; color: var(--muted); font-size: 13px; }
 .section-divider { margin: 22px 0 8px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--mutedest); }
+
+/* Hunting: the star is a workflow action (persists to disk when the
+   local dashboard server is running), not decoration -- sized and
+   colored to be an obvious, deliberate click target on every row/card. */
+.star-btn { border: none; background: none; cursor: pointer; font-size: 18px; line-height: 1; padding: 2px 4px; color: var(--mutedest); }
+.star-btn:hover { color: var(--watch); }
+.star-btn.starred { color: #d97706; }
+.pill-hunting { background: #fef3c7; color: #92400e; }
+.hunting-live-note { font-size: 11px; margin-top: 3px; }
+.hunting-live-note.live { color: var(--buy); }
+.hunting-live-note.offline { color: var(--mutedest); }
+.hunting-section input[type=number], .hunting-section textarea { font: inherit; font-size: 12.5px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; width: 100%; box-sizing: border-box; }
+.hunting-section textarea { min-height: 54px; resize: vertical; }
+.hunting-section .hunting-row { display: flex; gap: 10px; align-items: flex-start; margin-top: 6px; flex-wrap: wrap; }
+.hunting-section .hunting-field { flex: 1 1 200px; min-width: 160px; }
+.hunting-section .hunting-field label { display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--mutedest); margin-bottom: 3px; }
+.hunting-section button.save-btn { font-size: 12px; padding: 6px 12px; border: 1px solid var(--accent); color: var(--accent); background: #fff; border-radius: 6px; cursor: pointer; margin-top: 4px; }
+.hunting-offer-compare { display: flex; gap: 18px; font-size: 12.5px; margin-top: 4px; }
+.hunting-offer-compare div b { display: block; font-size: 15px; }
 </style>
 </head>
 """
@@ -466,7 +554,7 @@ _HTML_BODY_START = """<body>
         <div class="hello" id="hello-heading">Hello Rhys</div>
         <div class="hello-sub">Arbitrage Command Centre</div>
       </div>
-      <div class="status" id="status-line">Loading...</div>
+      <div class="status" id="status-line">Loading...<div id="hunting-live-note" class="hunting-live-note"></div></div>
     </div>
   </div>
 </header>
@@ -511,6 +599,9 @@ _HTML_MID_1 = """</script>
 _HTML_MID_2 = """</script>
 <script id="bankroll-data" type="application/json">"""
 
+_HTML_MID_3 = """</script>
+<script id="hunting-state-data" type="application/json">"""
+
 _HTML_BODY_END = """</script>
 """
 
@@ -519,9 +610,21 @@ _HTML_SCRIPT = r"""<script>
   var discoveryPayload = JSON.parse(document.getElementById('discovery-report-data').textContent);
   var legacyPayload = JSON.parse(document.getElementById('legacy-scan-data').textContent);
   var bankrollCfg = JSON.parse(document.getElementById('bankroll-data').textContent);
+  var huntingPayload = JSON.parse(document.getElementById('hunting-state-data').textContent);
 
   var discoveryOpportunities = (discoveryPayload && discoveryPayload.opportunities) || [];
   var legacyRows = (legacyPayload && legacyPayload.rows) || [];
+
+  // ---- Hunting: user workflow state, kept entirely separate from the two
+  // scanner payloads above. `huntingState` starts as the read-only
+  // snapshot embedded at generation time (works even opened via file://,
+  // so a star made before the last regeneration is still visible), then
+  // is opportunistically replaced with a live fetch() of the same shape
+  // from scanner/dashboard_server.py if that local server happens to be
+  // running -- see initHuntingLive() below. Nothing here ever writes back
+  // into discoveryPayload/legacyPayload.
+  var huntingState = (huntingPayload && huntingPayload.hunting) || {};
+  var liveMode = false;
 
   var PILL_CLASS = { 'BUY': 'pill-buy', 'WATCH': 'pill-watch', 'PASS': 'pill-pass', 'PROFITABLE BUT CAPITAL RISK': 'pill-risk' };
   // Sort tiers: real decisions rank by how actionable they are, unsupported
@@ -538,7 +641,8 @@ _HTML_SCRIPT = r"""<script>
   var state = {
     pipeline: 'all', decision: 'all', category: 'all', source: 'all',
     minPrice: '', maxPrice: '', minRoi: '', minConfidence: '',
-    showPass: false, hideNoConfidence: false, sortBy: 'default'
+    showPass: false, hideNoConfidence: false, sortBy: 'default',
+    huntingOnly: false
   };
   var expandedKey = null;
 
@@ -693,6 +797,113 @@ _HTML_SCRIPT = r"""<script>
     return TIER.PASS;
   }
 
+  // ---- Hunting: lookups against the separate huntingState map, keyed by
+  // source + canonical URL (matching scanner.hunting_store.make_key()).
+  // The discovery/legacy payloads embedded on this page are never
+  // touched to add a precomputed key (see this module's own docstring),
+  // so this mirrors scanner.search.util.canonicalize_url() here in JS,
+  // from each row's own existing source/url fields, well enough to match
+  // for the URL shapes this project's scrapers actually emit (plain
+  // paths, at most a few tracking query params -- see the tracking-param
+  // prefix list below, identical to the Python side's).
+  //
+  // This is an approximation, not a byte-identical port -- most notably,
+  // Python's urlencode() and JS's encodeURIComponent() escape a handful
+  // of characters (space, most visibly) differently. That could only
+  // cause a false negative on whether a row is *shown* as already
+  // starred; it can never affect whether starring/unstarring itself
+  // works, because the server always recomputes the authoritative key
+  // from the raw source/url a request sends it (see
+  // scanner/dashboard_server.py), never from anything this function
+  // returns.
+  var _TRACKING_PARAM_PREFIXES = ['utm_', 'gclid', 'fbclid', 'ref', 'src', 'cid', 'affid'];
+  function canonicalizeUrlJs(raw) {
+    if (!raw) return raw || '';
+    var trimmed = String(raw).trim();
+    var u;
+    try { u = new URL(trimmed); } catch (e) { return trimmed; }
+    var netloc = u.host.toLowerCase();
+    var path = u.pathname.replace(/\/+$/, '') || '/';
+    var pairs = [];
+    u.searchParams.forEach(function (v, k) {
+      var lower = k.toLowerCase();
+      var isTracking = _TRACKING_PARAM_PREFIXES.some(function (p) { return lower.indexOf(p) === 0; });
+      if (!isTracking) pairs.push([k, v]);
+    });
+    pairs.sort(function (a, b) {
+      if (a[0] !== b[0]) return a[0] < b[0] ? -1 : 1;
+      if (a[1] !== b[1]) return a[1] < b[1] ? -1 : 1;
+      return 0;
+    });
+    var query = pairs.map(function (p) { return encodeURIComponent(p[0]) + '=' + encodeURIComponent(p[1]); }).join('&');
+    return 'https://' + netloc + path + (query ? '?' + query : '');
+  }
+  function huntingKey(it) { return (source(it) || '').trim() + '|' + canonicalizeUrlJs(url(it)); }
+  function huntingEntry(it) { return huntingState[huntingKey(it)]; }
+  function isHunted(it) { return !!huntingEntry(it); }
+  function huntingCount() {
+    var n = 0;
+    items.forEach(function (it) { if (isHunted(it)) n++; });
+    return n;
+  }
+
+  function postJson(path, payload) {
+    return fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || ('HTTP ' + r.status)); });
+      return r.json();
+    });
+  }
+
+  function showHuntingError(msg) {
+    var note = document.getElementById('hunting-live-note');
+    if (!note) return;
+    note.textContent = msg;
+    note.className = 'hunting-live-note offline';
+  }
+
+  // Toggling the star is the one action available everywhere a row
+  // appears (Top opportunities, All opportunities, Hunting filter).
+  // Editing notes/target offer only happens in the expanded detail panel.
+  function toggleHunting(it) {
+    if (!liveMode) {
+      showHuntingError('Starring needs the local dashboard server running -- see README ("python -m scanner.dashboard_server"), then reload this page.');
+      return;
+    }
+    var already = isHunted(it);
+    var body = { source: source(it), url: url(it) };
+    var req = already ? postJson('/api/hunting/unstar', body) : postJson('/api/hunting/star', body);
+    req.then(function (resp) {
+      if (already) {
+        delete huntingState[resp.key];
+      } else {
+        huntingState[resp.key] = resp.entry;
+      }
+      render();
+    }).catch(function (err) {
+      showHuntingError('Could not reach the local dashboard server -- is it still running? (' + err.message + ')');
+    });
+  }
+
+  function saveHuntingNotes(it, notes) {
+    postJson('/api/hunting/notes', { source: source(it), url: url(it), notes: notes }).then(function (resp) {
+      huntingState[huntingKey(it)] = resp.entry;
+      render();
+    }).catch(function (err) { showHuntingError('Could not save notes: ' + err.message); });
+  }
+
+  function saveHuntingTargetOffer(it, value) {
+    var n = value === '' ? null : Number(value);
+    postJson('/api/hunting/target_offer', { source: source(it), url: url(it), target_offer_override: (n === null || isNaN(n)) ? null : n })
+      .then(function (resp) {
+        huntingState[huntingKey(it)] = resp.entry;
+        render();
+      }).catch(function (err) { showHuntingError('Could not save target offer: ' + err.message); });
+  }
+
   // ---- Filter option lists, built from whatever data actually exists ----
   function uniqueSorted(vals) {
     var seen = {}; var out = [];
@@ -723,7 +934,8 @@ _HTML_SCRIPT = r"""<script>
         ['price_high', 'Price: high to low'],
       ], state.sortBy)) +
       '<label class="checkbox"><input type="checkbox" id="f-hide-no-confidence"' + (state.hideNoConfidence ? ' checked' : '') + '> Hide items with no confidence data</label>' +
-      '<button id="toggle-pass" class="' + (state.showPass ? 'active' : '') + '">' + (state.showPass ? 'Hide passed' : 'Show passed') + '</button>';
+      '<button id="toggle-pass" class="' + (state.showPass ? 'active' : '') + '">' + (state.showPass ? 'Hide passed' : 'Show passed') + '</button>' +
+      '<button id="toggle-hunting" class="' + (state.huntingOnly ? 'active' : '') + '">' + (state.huntingOnly ? 'Show all' : ('★ Hunting (' + huntingCount() + ')')) + '</button>';
 
     function field(label, inner) { return '<div class="field"><span>' + label + '</span>' + inner + '</div>'; }
     function selectHtml(id, options, current) {
@@ -753,6 +965,23 @@ _HTML_SCRIPT = r"""<script>
       this.textContent = state.showPass ? 'Hide passed' : 'Show passed';
       render();
     });
+    var toggleHuntingBtn = document.getElementById('toggle-hunting');
+    toggleHuntingBtn.addEventListener('click', function () {
+      state.huntingOnly = !state.huntingOnly;
+      this.className = state.huntingOnly ? 'active' : '';
+      this.textContent = state.huntingOnly ? 'Show all' : ('★ Hunting (' + huntingCount() + ')');
+      render();
+    });
+  }
+
+  // Called after every star/unstar so the toggle button's live count
+  // stays correct even when the click that changed it happened on a row
+  // (not on this button) -- mirrors how togglePassBtn updates its own
+  // label in place above, without going through renderFilters().
+  function refreshHuntingToggleLabel() {
+    var btn = document.getElementById('toggle-hunting');
+    if (!btn) return;
+    btn.textContent = state.huntingOnly ? 'Show all' : ('★ Hunting (' + huntingCount() + ')');
   }
 
   // The dark header stays deliberately minimal -- just enough to say
@@ -765,8 +994,26 @@ _HTML_SCRIPT = r"""<script>
     var legTs = legacyPayload && legacyPayload.run_timestamp ? new Date(legacyPayload.run_timestamp).toLocaleString() : 'no daily scan run yet';
     var html =
       '<div class="status-row">Discovery updated <b>' + discTs + '</b></div>' +
-      '<div class="status-row">Daily scan updated <b>' + legTs + '</b></div>';
+      '<div class="status-row">Daily scan updated <b>' + legTs + '</b></div>' +
+      '<div id="hunting-live-note" class="hunting-live-note"></div>';
     document.getElementById('status-line').innerHTML = html;
+    refreshHuntingLiveNote();
+  }
+
+  // Tells Rhys, plainly, whether clicking a star right now will actually
+  // persist anywhere -- the embedded snapshot alone (no local server
+  // running) is read-only, and a click doing nothing with no explanation
+  // would look like a bug rather than a known, documented limitation.
+  function refreshHuntingLiveNote() {
+    var note = document.getElementById('hunting-live-note');
+    if (!note) return;
+    if (liveMode) {
+      note.textContent = 'Hunting: live -- stars save to disk';
+      note.className = 'hunting-live-note live';
+    } else {
+      note.textContent = 'Hunting: read-only snapshot -- run "python -m scanner.dashboard_server" to enable starring';
+      note.className = 'hunting-live-note offline';
+    }
   }
   function isUnsupportedRaw(o) { return o.verification_status && o.verification_status !== 'verified'; }
 
@@ -945,6 +1192,7 @@ _HTML_SCRIPT = r"""<script>
   }
 
   function passFilters(it) {
+    if (state.huntingOnly && !isHunted(it)) return false;
     if (state.pipeline !== 'all' && it.pipeline !== state.pipeline) return false;
     // "Show passed" hides PASS items from mixed views (All/other-decision)
     // by default, since they've already been rejected -- but explicitly
@@ -991,6 +1239,45 @@ _HTML_SCRIPT = r"""<script>
   function evidenceTag(type) {
     var cls = type === 'SOLD' ? 'evidence-badge sold' : 'evidence-badge';
     return '<span class="' + cls + '">' + (type || 'OTHER').replace('_', ' ').toLowerCase() + '</span>';
+  }
+
+  // Shared by both detail renderers below. Deliberately its own labeled
+  // section, visually and structurally separate from the scanner-authored
+  // sections around it -- this is the one place user-authored workflow
+  // state (huntingState) is shown, and it must never be confused with
+  // scanner output. Explicitly puts "Scanner max buy" and "Your target
+  // offer" side by side so the two numbers -- one computed, one the
+  // user's own -- can never be mistaken for each other.
+  function renderHuntingSection(it) {
+    var hunted = isHunted(it);
+    var entry = huntingEntry(it) || {};
+    var hasOverride = entry.target_offer_override !== null && entry.target_offer_override !== undefined;
+    var scannerMaxBuy = it.pipeline === 'discovery' ? money(it.raw.max_buy_price) : 'Not available (legacy pipeline has no max buy price)';
+
+    var statusLine = hunted
+      ? 'Hunting since ' + (entry.starred_at ? new Date(entry.starred_at).toLocaleString() : 'unknown time')
+      : 'Not currently hunting -- click the star above to start tracking this opportunity.';
+
+    var compare = '<div class="hunting-offer-compare">' +
+      '<div>Scanner max buy<b>' + scannerMaxBuy + '</b></div>' +
+      '<div>Your target offer<b>' + (hasOverride ? money(entry.target_offer_override) : 'Not set') + '</b></div>' +
+      '</div>';
+
+    var editRows = hunted
+      ? '<div class="hunting-row">' +
+        '<div class="hunting-field"><label>Your target offer ($, optional &mdash; your own number, separate from the scanner max buy above)</label>' +
+        '<input type="number" class="target-offer-input" value="' + (hasOverride ? entry.target_offer_override : '') + '"></div>' +
+        '<div class="hunting-field"><label>Notes</label><textarea class="notes-input">' + escapeHtml(entry.notes || '') + '</textarea></div>' +
+        '</div>' +
+        '<button type="button" class="save-btn">Save notes / target offer</button>'
+      : '';
+
+    return '<div class="sechead">Hunting (your workflow state &mdash; kept separate from scanner data)</div>' +
+      '<div class="hunting-section">' +
+      '<div style="font-size:13px;">' + escapeHtml(statusLine) + '</div>' +
+      compare +
+      editRows +
+      '</div>';
   }
 
   function renderDiscoveryDetail(it) {
@@ -1075,7 +1362,8 @@ _HTML_SCRIPT = r"""<script>
       '<div class="sechead">Valuation (scanner-generated estimate, not a verified fact)</div><div style="font-size:13px;">' + valLine + '</div>' + confBlock +
       '<div class="sechead">Cost breakdown</div>' + costRows +
       '<div class="sechead">Comparable evidence (' + evidence.length + ')</div>' + evidenceHtml +
-      '<div class="missing-note">Condition, listing location, image, and seller status are not currently part of the discovery pipeline&rsquo;s persisted output for this item. Target-offer price is also not tracked separately from Maximum buy today.</div>' +
+      renderHuntingSection(it) +
+      '<div class="missing-note">Condition, listing location, image, and seller status are not currently part of the discovery pipeline&rsquo;s persisted output for this item.</div>' +
       '</div>';
   }
 
@@ -1105,6 +1393,7 @@ _HTML_SCRIPT = r"""<script>
       '<div class="sechead">Potential profit</div><div style="font-size:13px;">' + money(r.potential_profit_nzd) + ' (' + pct(r.potential_profit_pct) + ') &middot; resale likelihood: ' + escapeHtml(r.resale_likelihood || 'Not available') + '</div>' +
       '<div style="font-size:12px;color:var(--muted);">' + escapeHtml(r.resale_reason || '') + '</div>' +
       (links ? '<div class="sechead">Manual comparable checks</div><div style="font-size:13px;">' + links + '</div>' : '') +
+      renderHuntingSection(it) +
       '<div class="missing-note">Flip score, valuation confidence, ROI range, liquidity classification, max buy price, and structured comparable evidence are not part of the legacy daily-scan pipeline&rsquo;s persisted output &mdash; this item was scored 1&ndash;10 by a separate, older code path. Reserve status and closing time exist only as free text inside "notes", not as separate fields.</div>' +
       '</div>';
   }
@@ -1125,11 +1414,15 @@ _HTML_SCRIPT = r"""<script>
       ? '<div class="no-evidence-flag">No comparable evidence</div>' : '';
 
     var maxBuy = it.pipeline === 'discovery' ? money(it.raw.max_buy_price) : 'Not available';
+    var hunted = isHunted(it);
+    var starTitle = hunted ? 'Stop hunting (unstar)' : 'Star: keep tracking this opportunity';
+    var starBtn = '<button type="button" class="star-btn' + (hunted ? ' starred' : '') + '" title="' + starTitle + '" aria-label="' + starTitle + '">' + (hunted ? '★' : '☆') + '</button>';
+    var huntingPill = hunted ? '<span class="pill pill-hunting">HUNTING</span>' : '';
 
     var rowHtml =
       '<div class="row-main">' +
       '<div class="row-left">' +
-      '<div class="row-head">' + pipelineTag + decisionPill + unsupportedPill +
+      '<div class="row-head">' + starBtn + pipelineTag + decisionPill + unsupportedPill + huntingPill +
       '<span class="score">' + nativeScoreLine(it) + '</span>' +
       confidenceGlance(it) +
       '</div>' +
@@ -1153,8 +1446,16 @@ _HTML_SCRIPT = r"""<script>
     row.className = 'row';
     row.dataset.key = it.key;
     row.innerHTML = rowHtml;
+    var starEl = row.querySelector('.star-btn');
+    if (starEl) {
+      starEl.addEventListener('click', function (e) {
+        e.stopPropagation();
+        toggleHunting(it);
+      });
+    }
     row.addEventListener('click', function (e) {
       if (e.target.closest('a')) return;
+      if (e.target.closest('.star-btn')) return;
       expandedKey = (expandedKey === it.key) ? null : it.key;
       render();
     });
@@ -1163,6 +1464,16 @@ _HTML_SCRIPT = r"""<script>
       var detailWrap = document.createElement('div');
       detailWrap.innerHTML = it.pipeline === 'discovery' ? renderDiscoveryDetail(it) : renderLegacyDetail(it);
       detailWrap.firstChild.addEventListener('click', function (e) { e.stopPropagation(); });
+      var saveBtn = detailWrap.firstChild.querySelector('.hunting-section .save-btn');
+      if (saveBtn) {
+        saveBtn.addEventListener('click', function () {
+          var section = saveBtn.closest('.hunting-section');
+          var notesVal = section.querySelector('.notes-input').value;
+          var offerVal = section.querySelector('.target-offer-input').value;
+          saveHuntingNotes(it, notesVal);
+          saveHuntingTargetOffer(it, offerVal);
+        });
+      }
       row.appendChild(detailWrap.firstChild);
     }
     return row;
@@ -1188,6 +1499,8 @@ _HTML_SCRIPT = r"""<script>
   // views, so they don't need to re-render on every keystroke either.
   function render() {
     renderTopOpportunities();
+    refreshHuntingToggleLabel();
+    refreshHuntingLiveNote();
 
     var queue = document.getElementById('queue');
     queue.innerHTML = '';
@@ -1209,6 +1522,25 @@ _HTML_SCRIPT = r"""<script>
   renderBrowseBreakdown();
   renderFilters();
   render();
+
+  // Upgrade from the embedded read-only Hunting snapshot to live state if
+  // scanner/dashboard_server.py happens to be serving this page right now
+  // (same-origin fetch succeeds only in that case -- opened via file://,
+  // or via this same server with no listener, it fails fast and this page
+  // simply stays on the embedded snapshot). Deliberately does not block
+  // the first paint above: the snapshot renders immediately, then this
+  // silently re-renders once if it upgrades to live.
+  fetch('/api/hunting', { cache: 'no-store' }).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (data) {
+    liveMode = true;
+    huntingState = (data && data.hunting) || {};
+    render();
+  }).catch(function () {
+    liveMode = false;
+    refreshHuntingLiveNote();
+  });
 })();
 </script>
 """
