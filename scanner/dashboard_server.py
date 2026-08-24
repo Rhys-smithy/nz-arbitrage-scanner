@@ -20,7 +20,11 @@ you're done. It does exactly two jobs:
    -- the exact same store ``scanner/deal_queue_report.py`` reads
    (read-only) when it embeds a snapshot of hunting state at generation
    time. This process is the only thing that ever writes
-   ``data/hunting_state.json``.
+   ``data/hunting_state.json``. The same JSON API also exposes the
+   Pending Review queue (``scanner/pending_review_store.py``) -- this is
+   the only thing that ever writes ``data/pending_review_state.json``.
+   Pursue composes both stores (mark resolved here, star into Hunting);
+   Reject only ever touches the Pending Review store.
 
 It also owns the Command Centre's "Run Scan" on-demand-scan workflow, for
 the same reason: a click needs somewhere to start a scan and somewhere to
@@ -77,6 +81,13 @@ from scanner.hunting_store import (
     unstar,
     update_notes,
     update_target_offer,
+)
+from scanner.pending_review_store import (
+    DEFAULT_PATH as DEFAULT_PENDING_REVIEW_PATH,
+    load_pending_review_state,
+    resolve_pursued,
+    resolve_rejected,
+    save_pending_review_state,
 )
 from scanner import scan_lock, scan_progress
 
@@ -182,6 +193,8 @@ _API_ROUTES = (
     "/api/hunting/unstar",
     "/api/hunting/notes",
     "/api/hunting/target_offer",
+    "/api/pending_review/pursue",
+    "/api/pending_review/reject",
 )
 
 
@@ -239,6 +252,10 @@ class HuntingRequestHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/hunting":
             state = load_hunting_state()
             self._send_json(200, {"hunting": state})
+            return
+        if self.path == "/api/pending_review":
+            state = load_pending_review_state()
+            self._send_json(200, {"pending_review": state})
             return
         if self.path == "/api/scan/status":
             self._send_json(200, scan_progress.load_progress())
@@ -304,6 +321,43 @@ class HuntingRequestHandler(SimpleHTTPRequestHandler):
                     return
                 save_hunting_state(state)
                 self._send_json(200, {"entry": entry})
+                return
+
+            if self.path == "/api/pending_review/pursue":
+                # Composes both stores under the one write lock: mark this
+                # module's own record resolved (Pursued), then star the
+                # same listing into the pre-existing Hunting workflow via
+                # the identical source+canonical-URL key -- see
+                # scanner/pending_review_store.py's module docstring for
+                # why that key is guaranteed to match with no re-derivation.
+                # `state` (loaded above) is already the current Hunting
+                # state -- reused here rather than re-reading it a second
+                # time.
+                pending_state = load_pending_review_state()
+                pending_entry = resolve_pursued(pending_state, source, url)
+                if pending_entry is None:
+                    self._send_json(404, {"error": "not currently in pending review"})
+                    return
+                save_pending_review_state(pending_state)
+
+                hunting_entry = star(state, source, url)
+                save_hunting_state(state)
+
+                self._send_json(200, {
+                    "key": make_key(source, url),
+                    "pending_review": pending_entry,
+                    "hunting": hunting_entry,
+                })
+                return
+
+            if self.path == "/api/pending_review/reject":
+                pending_state = load_pending_review_state()
+                pending_entry = resolve_rejected(pending_state, source, url)
+                if pending_entry is None:
+                    self._send_json(404, {"error": "not currently in pending review"})
+                    return
+                save_pending_review_state(pending_state)
+                self._send_json(200, {"key": make_key(source, url), "pending_review": pending_entry})
                 return
 
 

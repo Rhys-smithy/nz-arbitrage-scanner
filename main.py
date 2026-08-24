@@ -297,6 +297,11 @@ def main():
     if args.mode == "discover":
         from scanner.deal_queue_report import render_latest_deal_queue
         from scanner.discover import print_top_opportunities, run_discovery, send_discovery_alerts
+        from scanner.pending_review_store import (
+            load_pending_review_state,
+            save_pending_review_state,
+            sync_new_watch_opportunities,
+        )
 
         # Cross-process guard: nothing about dashboard_server.py's own
         # "Run Scan" click handling (its in-process _scan_lock/_scan_process
@@ -337,6 +342,26 @@ def main():
             scan_progress.start_progress()
             try:
                 opportunities = run_discovery(config)
+
+                # Pending Review: a durable human-review queue over WATCH
+                # opportunities, separate from run_discovery()'s own
+                # persisted output (scanner/discovery_report.py, untouched
+                # by this call -- opportunities is read-only here). Without
+                # this, a WATCH item found today simply stops appearing on
+                # the dashboard the moment any later scan (this one
+                # included) no longer finds it, before it's ever reviewed
+                # -- see scanner/pending_review_store.py's module
+                # docstring. Synced before render_latest_deal_queue() below
+                # so this run's newly-pending items are already on disk by
+                # the time that call reads and embeds them.
+                pending_review_state = load_pending_review_state()
+                newly_pending = sync_new_watch_opportunities(pending_review_state, opportunities)
+                save_pending_review_state(pending_review_state)
+                if newly_pending:
+                    print(
+                        f"[main] {len(newly_pending)} new WATCH opportunit"
+                        f"{'y' if len(newly_pending) == 1 else 'ies'} added to Pending Review."
+                    )
 
                 # run_discovery() already persisted this run's Opportunity
                 # results (scanner/discovery_report.py) regardless of

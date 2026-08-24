@@ -12,6 +12,7 @@ from http.server import ThreadingHTTPServer
 from unittest import mock
 
 from scanner import dashboard_server, scan_lock, scan_progress
+from scanner import hunting_store, pending_review_store
 
 
 class _FakeProcess:
@@ -289,6 +290,186 @@ class DashboardServerScanEndpointsTest(unittest.TestCase):
         status, body = self._get("/api/hunting")
         self.assertEqual(status, 200)
         self.assertIn("hunting", body)
+
+
+class DashboardServerPendingReviewEndpointsTest(unittest.TestCase):
+    """Exercises GET /api/pending_review and POST /api/pending_review/pursue
+    and /reject against a real ThreadingHTTPServer, the same style as
+    DashboardServerScanEndpointsTest above."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard_server.HuntingRequestHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def setUp(self):
+        # data/pending_review_state.json and data/hunting_state.json are
+        # real, shared state files (see DashboardServerScanEndpointsTest's
+        # setUp above for the identical rationale re: scan_progress.json /
+        # scan.lock) -- back both up and restore them after each test so
+        # these tests never leave a permanent side effect on the repo.
+        self._paths = {
+            "pending_review": pending_review_store.DEFAULT_PATH,
+            "hunting": hunting_store.DEFAULT_PATH,
+        }
+        self._backups = {}
+        for name, path in self._paths.items():
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    self._backups[name] = f.read()
+                os.remove(path)
+            else:
+                self._backups[name] = None
+
+    def tearDown(self):
+        for name, path in self._paths.items():
+            if os.path.exists(path):
+                os.remove(path)
+            if self._backups[name] is not None:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self._backups[name])
+
+    def _url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def _get(self, path):
+        with urllib.request.urlopen(self._url(path), timeout=5) as r:
+            return r.status, json.loads(r.read())
+
+    def _post(self, path, body=None):
+        data = json.dumps(body or {}).encode("utf-8")
+        req = urllib.request.Request(self._url(path), data=data, method="POST",
+                                      headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def _seed_pending(self, source="Turners", url="https://www.turners.co.nz/x"):
+        state = pending_review_store.load_pending_review_state()
+
+        class _FakeOpp:
+            pass
+
+        o = _FakeOpp()
+        o.decision = "WATCH"
+        o.source = source
+        o.url = url
+        o.title = "Exercise Bike"
+        o.current_price = 1.0
+        o.buy_now_price = None
+        o.flip_score = 42
+        o.verification_status = "verified"
+        pending_review_store.sync_new_watch_opportunities(state, [o])
+        pending_review_store.save_pending_review_state(state)
+
+    def test_get_pending_review_when_empty(self):
+        status, body = self._get("/api/pending_review")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"pending_review": {}})
+
+    def test_get_pending_review_reflects_persisted_state(self):
+        self._seed_pending()
+        status, body = self._get("/api/pending_review")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["pending_review"]), 1)
+        entry = list(body["pending_review"].values())[0]
+        self.assertEqual(entry["status"], "pending")
+
+    def test_pursue_unknown_listing_returns_404(self):
+        status, body = self._post("/api/pending_review/pursue", {"source": "Turners", "url": "https://www.turners.co.nz/never-seen"})
+        self.assertEqual(status, 404)
+
+    def test_reject_unknown_listing_returns_404(self):
+        status, body = self._post("/api/pending_review/reject", {"source": "Turners", "url": "https://www.turners.co.nz/never-seen"})
+        self.assertEqual(status, 404)
+
+    def test_pursue_resolves_pending_review_and_stars_hunting(self):
+        self._seed_pending(url="https://www.turners.co.nz/pursue-me")
+        status, body = self._post("/api/pending_review/pursue", {"source": "Turners", "url": "https://www.turners.co.nz/pursue-me"})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["pending_review"]["status"], "pursued")
+        self.assertEqual(body["hunting"]["status"], "hunting")
+
+        # Persisted to both stores, not just returned in the response.
+        pending_state = pending_review_store.load_pending_review_state()
+        entry = pending_review_store.get(pending_state, "Turners", "https://www.turners.co.nz/pursue-me")
+        self.assertEqual(entry["status"], "pursued")
+
+        hunting_state = hunting_store.load_hunting_state()
+        hunting_entry = hunting_store.get(hunting_state, "Turners", "https://www.turners.co.nz/pursue-me")
+        self.assertIsNotNone(hunting_entry)
+        self.assertEqual(hunting_entry["status"], "hunting")
+
+    def test_pursue_key_matches_hunting_key_for_the_same_listing(self):
+        # The client-side JS relies on this exact identity so it can apply
+        # the response's "hunting" entry to huntingState under the same
+        # key with no re-derivation -- see scanner/deal_queue_report.py's
+        # resolvePendingReview().
+        self._seed_pending(url="https://www.turners.co.nz/pursue-me")
+        status, body = self._post("/api/pending_review/pursue", {"source": "Turners", "url": "https://www.turners.co.nz/pursue-me"})
+        self.assertEqual(body["key"], hunting_store.make_key("Turners", "https://www.turners.co.nz/pursue-me"))
+
+    def test_reject_resolves_pending_review_without_touching_hunting(self):
+        self._seed_pending(url="https://www.turners.co.nz/reject-me")
+        status, body = self._post("/api/pending_review/reject", {"source": "Turners", "url": "https://www.turners.co.nz/reject-me"})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["pending_review"]["status"], "rejected")
+        self.assertNotIn("hunting", body)
+
+        hunting_state = hunting_store.load_hunting_state()
+        self.assertEqual(hunting_state, {})
+
+    def test_reject_then_resync_does_not_recreate_the_pending_item(self):
+        # End-to-end regression guard for "Reject ... persists the
+        # resolution so the same listing does not immediately re-enter as
+        # a new pending item on the next scan" -- exercised through the
+        # real HTTP endpoint this time, not just the store function
+        # directly (see tests/test_pending_review_store.py for that).
+        url = "https://www.turners.co.nz/reject-me-too"
+        self._seed_pending(url=url)
+        self._post("/api/pending_review/reject", {"source": "Turners", "url": url})
+
+        class _FakeOpp:
+            pass
+
+        o = _FakeOpp()
+        o.decision = "WATCH"
+        o.source = "Turners"
+        o.url = url
+        o.title = "Exercise Bike"
+        o.current_price = 1.0
+        o.buy_now_price = None
+        o.flip_score = 42
+        o.verification_status = "verified"
+
+        state = pending_review_store.load_pending_review_state()
+        added = pending_review_store.sync_new_watch_opportunities(state, [o])
+
+        self.assertEqual(added, [])
+        self.assertEqual(len(state), 1)
+        self.assertEqual(list(state.values())[0]["status"], "rejected")
+
+    def test_pending_review_endpoint_unaffected_by_hunting_and_scan_routes(self):
+        # Regression guard, mirroring test_hunting_endpoint_unaffected_by_scan_routing_changes:
+        # adding the /api/pending_review/* routes must not disturb the
+        # pre-existing Hunting/scan routes they sit alongside.
+        status, body = self._get("/api/hunting")
+        self.assertEqual(status, 200)
+        self.assertIn("hunting", body)
+        status, body = self._get("/api/scan/status")
+        self.assertEqual(status, 200)
 
 
 if __name__ == "__main__":

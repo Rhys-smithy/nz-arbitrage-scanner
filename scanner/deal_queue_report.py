@@ -110,6 +110,8 @@ from typing import Optional
 from scanner.discovery_report import DEFAULT_INDEX_PATH, REPORTS_DIR
 from scanner.hunting_store import DEFAULT_PATH as DEFAULT_HUNTING_STATE_PATH
 from scanner.hunting_store import load_hunting_state
+from scanner.pending_review_store import DEFAULT_PATH as DEFAULT_PENDING_REVIEW_PATH
+from scanner.pending_review_store import load_pending_review_state
 
 DEFAULT_OUTPUT_PATH = os.path.join(REPORTS_DIR, "deal_queue.html")
 
@@ -312,6 +314,17 @@ def load_hunting_payload(hunting_state_path: str = DEFAULT_HUNTING_STATE_PATH) -
     return {"hunting": load_hunting_state(hunting_state_path)}
 
 
+def load_pending_review_payload(pending_review_state_path: str = DEFAULT_PENDING_REVIEW_PATH) -> dict:
+    """Reads data/pending_review_state.json via scanner.pending_review_store
+    (same missing/corrupt-file -> {} handling as that module) and returns
+    it wrapped as {"pending_review": {...}} -- the exact shape
+    scanner/dashboard_server.py's live GET /api/pending_review endpoint
+    also returns, mirroring load_hunting_payload() above exactly. Never
+    returns None: an absent/corrupt file is legitimately "nothing pending
+    yet"."""
+    return {"pending_review": load_pending_review_state(pending_review_state_path)}
+
+
 def render_latest_deal_queue(
     index_path: str = DEFAULT_INDEX_PATH,
     legacy_index_path: Optional[str] = None,
@@ -319,6 +332,7 @@ def render_latest_deal_queue(
     output_path: str = DEFAULT_OUTPUT_PATH,
     config_path: Optional[str] = None,
     hunting_state_path: Optional[str] = None,
+    pending_review_state_path: Optional[str] = None,
 ) -> Optional[str]:
     """Loads the latest persisted discovery payload AND the latest
     persisted legacy-scan payload -- independently; neither pipeline's
@@ -332,10 +346,11 @@ def render_latest_deal_queue(
     call time, not import time), mirroring `legacy_index_path`'s
     reports_dir-relative default -- so a caller/test that only overrides
     `reports_dir` still gets an isolated default instead of silently
-    reading the real repo's config.json. `hunting_state_path` defaults to
-    scanner.hunting_store.DEFAULT_PATH (data/hunting_state.json) the same
-    way, resolved at call time so test isolation works the same as the
-    other two.
+    reading the real repo's config.json. `hunting_state_path` and
+    `pending_review_state_path` default to scanner.hunting_store.DEFAULT_PATH
+    (data/hunting_state.json) and scanner.pending_review_store.DEFAULT_PATH
+    (data/pending_review_state.json) the same way, each resolved at call
+    time so test isolation works the same as the other two.
 
     Returns the path written, or None only if NEITHER pipeline has ever
     produced a persisted run (nothing to show at all) -- Hunting state
@@ -354,11 +369,19 @@ def render_latest_deal_queue(
         hunting_state_path = DEFAULT_HUNTING_STATE_PATH
     hunting_payload = load_hunting_payload(hunting_state_path=hunting_state_path)
 
+    if pending_review_state_path is None:
+        pending_review_state_path = DEFAULT_PENDING_REVIEW_PATH
+    pending_review_payload = load_pending_review_payload(pending_review_state_path=pending_review_state_path)
+
     # discovery_payload/legacy_payload are embedded exactly as loaded --
     # no copy, no added field, no recomputation. See the module docstring's
     # "Hunting (starring)" section for how the page matches a row to its
     # Hunting record without needing this module to touch either payload.
-    html = _render_html(discovery_payload, legacy_payload, bankroll_cfg, hunting_payload)
+    # pending_review_payload is the same read-only-embed treatment, one
+    # more independent payload alongside hunting_payload -- see
+    # scanner/pending_review_store.py's own module docstring for why it's
+    # kept as a separate file/store rather than folded into Hunting's.
+    html = _render_html(discovery_payload, legacy_payload, bankroll_cfg, hunting_payload, pending_review_payload)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -382,9 +405,12 @@ def _render_html(
     legacy_payload: Optional[dict] = None,
     bankroll_cfg: Optional[dict] = None,
     hunting_payload: Optional[dict] = None,
+    pending_review_payload: Optional[dict] = None,
 ) -> str:
     if hunting_payload is None:
         hunting_payload = {"hunting": {}}
+    if pending_review_payload is None:
+        pending_review_payload = {"pending_review": {}}
     return (
         _HTML_HEAD
         + _HTML_STYLE
@@ -396,6 +422,8 @@ def _render_html(
         + _embed(bankroll_cfg)
         + _HTML_MID_3
         + _embed(hunting_payload)
+        + _HTML_MID_4
+        + _embed(pending_review_payload)
         + _HTML_BODY_END
         + _HTML_SCRIPT
         + _HTML_FOOT
@@ -576,6 +604,16 @@ main { max-width: 1180px; margin: 0 auto; padding: 18px 16px 60px; }
 .scan-note.scan-stalled { color: var(--warn); }
 .scan-note.scan-offline { color: var(--mutedest); }
 
+/* Pending Review: minimum controls needed to resolve a queued WATCH item
+   -- two buttons, no expand/detail panel (this queue only ever holds the
+   small display snapshot scanner/pending_review_store.py persists, not
+   the full opportunity record). */
+#pending-review-section { display: none; }
+.pending-review-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+.pending-review-btn { font-size: 12.5px; font-weight: 600; padding: 6px 14px; border-radius: 7px; cursor: pointer; background: var(--card); }
+.pending-review-btn.pursue { border: 1px solid var(--buy); color: var(--buy); }
+.pending-review-btn.reject { border: 1px solid var(--border); color: var(--muted); }
+
 .hunting-section .hunting-field { flex: 1 1 200px; min-width: 160px; }
 .hunting-section .hunting-field label { display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--mutedest); margin-bottom: 3px; }
 .hunting-section button.save-btn { font-size: 12px; padding: 6px 12px; border: 1px solid var(--accent); color: var(--accent); background: #fff; border-radius: 6px; cursor: pointer; margin-top: 4px; }
@@ -604,6 +642,14 @@ _HTML_BODY_START = """<body>
       <div id="scan-status" class="scan-status" style="display:none;"></div>
     </div>
     <div class="metrics-row" id="metrics-row"></div>
+
+    <div class="section-block" id="pending-review-section">
+      <div class="section-title-row">
+        <h2>Pending Review</h2>
+        <span class="section-note">WATCH opportunities awaiting your decision &mdash; these stay listed here even after they drop out of the latest scan, until you Pursue or Reject them.</span>
+      </div>
+      <div class="queue" id="pending-review-list"></div>
+    </div>
 
     <div class="section-block">
       <div class="section-title-row">
@@ -645,6 +691,9 @@ _HTML_MID_2 = """</script>
 _HTML_MID_3 = """</script>
 <script id="hunting-state-data" type="application/json">"""
 
+_HTML_MID_4 = """</script>
+<script id="pending-review-data" type="application/json">"""
+
 _HTML_BODY_END = """</script>
 """
 
@@ -654,6 +703,7 @@ _HTML_SCRIPT = r"""<script>
   var legacyPayload = JSON.parse(document.getElementById('legacy-scan-data').textContent);
   var bankrollCfg = JSON.parse(document.getElementById('bankroll-data').textContent);
   var huntingPayload = JSON.parse(document.getElementById('hunting-state-data').textContent);
+  var pendingReviewPayload = JSON.parse(document.getElementById('pending-review-data').textContent);
 
   var discoveryOpportunities = (discoveryPayload && discoveryPayload.opportunities) || [];
   var legacyRows = (legacyPayload && legacyPayload.rows) || [];
@@ -668,6 +718,15 @@ _HTML_SCRIPT = r"""<script>
   // into discoveryPayload/legacyPayload.
   var huntingState = (huntingPayload && huntingPayload.hunting) || {};
   var liveMode = false;
+
+  // ---- Pending Review: a durable human-review queue over WATCH
+  // opportunities, kept entirely separate from the scanner payloads and
+  // from huntingState above -- see scanner/pending_review_store.py's
+  // module docstring. Like huntingState, this starts as the read-only
+  // embedded snapshot (works even opened via file://) and upgrades to a
+  // live fetch() once the local dashboard server is confirmed reachable
+  // (piggybacks on the same liveMode flag the Hunting upgrade below sets).
+  var pendingReviewState = (pendingReviewPayload && pendingReviewPayload.pending_review) || {};
 
   var PILL_CLASS = { 'BUY': 'pill-buy', 'WATCH': 'pill-watch', 'PASS': 'pill-pass', 'PROFITABLE BUT CAPITAL RISK': 'pill-risk' };
   // Sort tiers: real decisions rank by how actionable they are, unsupported
@@ -945,6 +1004,87 @@ _HTML_SCRIPT = r"""<script>
         huntingState[huntingKey(it)] = resp.entry;
         render();
       }).catch(function (err) { showHuntingError('Could not save target offer: ' + err.message); });
+  }
+
+  // ---- Pending Review: minimum controls needed to Pursue or Reject a
+  // queued WATCH item. Reads only pendingReviewState -- never the
+  // discovery/legacy payloads -- since a pending entry must still render
+  // after the listing itself has dropped out of the latest scan; the
+  // small snapshot scanner/pending_review_store.py persisted at add-time
+  // (title/source/price/flip_score) is all this has to work with, so
+  // unlike renderRow() there is no expand/detail panel here.
+  function pendingReviewEntries() {
+    var out = [];
+    Object.keys(pendingReviewState).forEach(function (key) {
+      var e = pendingReviewState[key];
+      if (e && e.status === 'pending') out.push(e);
+    });
+    out.sort(function (a, b) { return (b.found_at || '').localeCompare(a.found_at || ''); });
+    return out;
+  }
+
+  function pendingReviewRow(entry) {
+    var priceVal = (entry.current_price !== null && entry.current_price !== undefined) ? entry.current_price : entry.buy_now_price;
+    var scoreLine = (entry.flip_score === null || entry.flip_score === undefined) ? 'Not available' : entry.flip_score + '/100';
+    var foundLine = entry.found_at ? new Date(entry.found_at).toLocaleDateString() : 'unknown date';
+    var rowHtml =
+      '<div class="row-main">' +
+      '<div class="row-left">' +
+      '<div class="row-head"><span class="pill pill-watch">WATCH</span><span class="score">' + escapeHtml(scoreLine) + '</span></div>' +
+      '<div class="title">' + escapeHtml(entry.title || '(untitled)') + '</div>' +
+      '<div class="source">' + escapeHtml(entry.source || 'Unknown source') + ' &middot; found ' + foundLine +
+      ' &middot; <a href="' + escapeAttr(entry.url) + '" target="_blank" rel="noopener">Open listing &#8599;</a></div>' +
+      '</div>' +
+      '<div class="row-right">' +
+      '<div class="price-line"><span class="price-block"><span class="price-figure">' + money(priceVal) + '</span><span class="price-label">Asking</span></span></div>' +
+      '<div class="pending-review-actions">' +
+      '<button type="button" class="pending-review-btn pursue">Pursue</button>' +
+      '<button type="button" class="pending-review-btn reject">Reject</button>' +
+      '</div>' +
+      '</div>' +
+      '</div>';
+
+    var row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = rowHtml;
+    row.querySelector('.pursue').addEventListener('click', function () { resolvePendingReview(entry, 'pursue'); });
+    row.querySelector('.reject').addEventListener('click', function () { resolvePendingReview(entry, 'reject'); });
+    return row;
+  }
+
+  function renderPendingReview() {
+    var section = document.getElementById('pending-review-section');
+    var listEl = document.getElementById('pending-review-list');
+    if (!section || !listEl) return;
+    var entries = pendingReviewEntries();
+    // Explicit 'block', not '' -- an empty string clears any inline
+    // override but falls back to the stylesheet's own #pending-review-section
+    // { display: none; } default (hidden until proven non-empty), so it
+    // would never actually show the section even with entries present.
+    section.style.display = entries.length ? 'block' : 'none';
+    listEl.innerHTML = '';
+    entries.forEach(function (entry) { listEl.appendChild(pendingReviewRow(entry)); });
+  }
+
+  function resolvePendingReview(entry, action) {
+    if (!liveMode) {
+      showHuntingError('Pending Review needs the local dashboard server running -- see README ("python -m scanner.dashboard_server"), then reload this page.');
+      return;
+    }
+    var path = action === 'pursue' ? '/api/pending_review/pursue' : '/api/pending_review/reject';
+    postJson(path, { source: entry.source, url: entry.url }).then(function (resp) {
+      pendingReviewState[resp.key] = resp.pending_review;
+      // Pending Review and Hunting share the exact same source+canonical-URL
+      // key (see scanner/pending_review_store.py) -- so on Pursue,
+      // resp.key also is huntingState's key for this same listing, no
+      // re-derivation needed to keep the star/HUNTING pill on any
+      // currently-visible row for it in sync without a page reload.
+      if (resp.hunting) huntingState[resp.key] = resp.hunting;
+      renderPendingReview();
+      render();
+    }).catch(function (err) {
+      showHuntingError('Could not update Pending Review: ' + err.message);
+    });
   }
 
   // ---- Filter option lists, built from whatever data actually exists ----
@@ -1562,6 +1702,7 @@ _HTML_SCRIPT = r"""<script>
 
   renderStatus();
   renderMetrics();
+  renderPendingReview();
   renderBrowseBreakdown();
   renderFilters();
   render();
@@ -1584,6 +1725,22 @@ _HTML_SCRIPT = r"""<script>
     liveMode = false;
     refreshHuntingLiveNote();
   });
+
+  // Same upgrade, same reason, for Pending Review: the embedded snapshot
+  // above is only as fresh as this page's last regeneration (the next
+  // scan, or main.py's own sync -- see scanner/pending_review_store.py),
+  // but a Pursue/Reject resolves instantly on disk via
+  // scanner/dashboard_server.py without regenerating deal_queue.html. A
+  // page reload right after resolving an item must not show it as still
+  // pending again just because the static snapshot hasn't caught up --
+  // so, exactly like Hunting, this re-fetches the live, current state.
+  fetch('/api/pending_review', { cache: 'no-store' }).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (data) {
+    pendingReviewState = (data && data.pending_review) || {};
+    renderPendingReview();
+  }).catch(function () { /* server not reachable -- stay on the embedded snapshot */ });
 
   // ---- Run Scan: on-demand discovery scan + live progress -------------
   // Talks to scanner/dashboard_server.py's POST /api/scan/start and

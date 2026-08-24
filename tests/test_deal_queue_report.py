@@ -18,6 +18,7 @@ from scanner.deal_queue_report import (
 from scanner.discovery_report import write_discovery_report, update_discovery_index
 from scanner.hunting_store import save_hunting_state, star
 from scanner.models import ComparableEvidence, CostBreakdown, Opportunity, ProductIdentification, ResaleValuation
+from scanner.pending_review_store import save_pending_review_state, sync_new_watch_opportunities
 from scanner.report import FIELDNAMES as LEGACY_FIELDNAMES
 
 
@@ -901,6 +902,128 @@ class TestRenderLatestDealQueueWithHuntingState(unittest.TestCase):
         html = self._render()
         self.assertIn("fetch('/api/hunting'", html)
         self.assertIn("liveMode = true;", html)
+
+
+class TestRenderLatestDealQueueWithPendingReview(unittest.TestCase):
+    """The Pending Review persistence slice: a fourth, independent payload
+    embedded alongside discovery/legacy/hunting, without mutating any of
+    them."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.index_path = os.path.join(self.tmpdir.name, "discovery_index.json")
+        self.output_path = os.path.join(self.tmpdir.name, "deal_queue.html")
+        self.pending_review_state_path = os.path.join(self.tmpdir.name, "pending_review_state.json")
+
+    def _persist_run(self, opportunities, **meta_overrides):
+        meta = {
+            "run_timestamp": "2026-08-25T09:00:00+00:00", "mode": "discover", "queries_run": 5,
+            "candidates_found": 1, "candidates_verified": 1, "candidates_verification_dropped": 0,
+            "opportunity_count": len(opportunities), "decision_counts": {},
+        }
+        meta.update(meta_overrides)
+        path, payload = write_discovery_report(opportunities, meta, reports_dir=self.tmpdir.name)
+        update_discovery_index(path, payload, index_path=self.index_path)
+        return payload
+
+    def _render(self):
+        render_latest_deal_queue(
+            index_path=self.index_path, reports_dir=self.tmpdir.name, output_path=self.output_path,
+            pending_review_state_path=self.pending_review_state_path,
+        )
+        with open(self.output_path, encoding="utf-8") as f:
+            return f.read()
+
+    def _embedded_json(self, html, element_id):
+        start_marker = '<script id="%s" type="application/json">' % element_id
+        end_marker = "</script>"
+        start = html.index(start_marker) + len(start_marker)
+        end = html.index(end_marker, start)
+        return json.loads(html[start:end])
+
+    def test_renders_empty_pending_review_snapshot_when_no_state_file_exists(self):
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        html = self._render()
+        embedded = self._embedded_json(html, "pending-review-data")
+        self.assertEqual(embedded, {"pending_review": {}})
+
+    def test_embeds_persisted_pending_review_state_verbatim(self):
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        state = {}
+        sync_new_watch_opportunities(state, [_opportunity(decision="WATCH", flip_score=40)])
+        save_pending_review_state(state, self.pending_review_state_path)
+
+        html = self._render()
+        embedded = self._embedded_json(html, "pending-review-data")
+        self.assertEqual(embedded, {"pending_review": state})
+        entry = list(embedded["pending_review"].values())[0]
+        self.assertEqual(entry["status"], "pending")
+        self.assertEqual(entry["flip_score"], 40)
+
+    def test_discovery_payload_embedding_is_not_mutated_by_pending_review(self):
+        # Regression guard for the separation-of-concerns requirement:
+        # loading/embedding Pending Review state alongside the discovery
+        # payload must not add, remove, or alter any field on the
+        # discovery opportunities themselves.
+        payload = self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        state = {}
+        sync_new_watch_opportunities(state, [_opportunity(decision="WATCH")])
+        save_pending_review_state(state, self.pending_review_state_path)
+
+        html = self._render()
+        embedded_discovery = self._embedded_json(html, "discovery-report-data")
+        self.assertEqual(embedded_discovery, payload)
+        self.assertNotIn("pending_review", json.dumps(embedded_discovery))
+
+    def test_default_pending_review_state_path_is_derived_at_call_time_not_import_time(self):
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        render_latest_deal_queue(
+            index_path=self.index_path, reports_dir=self.tmpdir.name, output_path=self.output_path,
+        )
+        with open(self.output_path, encoding="utf-8") as f:
+            html = f.read()
+        embedded = self._embedded_json(html, "pending-review-data")
+        self.assertIn("pending_review", embedded)
+
+    def test_html_includes_pending_review_section_and_action_buttons(self):
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        html = self._render()
+        self.assertIn('id="pending-review-section"', html)
+        self.assertIn('id="pending-review-list"', html)
+        self.assertIn("pending-review-btn pursue", html)
+        self.assertIn("pending-review-btn reject", html)
+        self.assertIn("resolvePendingReview(entry, 'pursue')", html)
+        self.assertIn("resolvePendingReview(entry, 'reject')", html)
+
+    def test_html_pending_review_action_posts_to_dedicated_endpoints(self):
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        html = self._render()
+        self.assertIn("/api/pending_review/pursue", html)
+        self.assertIn("/api/pending_review/reject", html)
+
+    def test_html_upgrades_pending_review_to_live_state_via_fetch_on_load(self):
+        # Regression guard: a Pursue/Reject persists to disk instantly
+        # (scanner/dashboard_server.py) without regenerating
+        # deal_queue.html, so a reload right after resolving an item must
+        # re-fetch live state rather than show the stale embedded
+        # snapshot's pre-resolution status again -- mirrors the exact
+        # upgrade-on-load pattern Hunting already uses.
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        html = self._render()
+        self.assertIn("fetch('/api/pending_review'", html)
+        self.assertIn("pendingReviewState = (data && data.pending_review) || {};", html)
+
+    def test_pending_review_section_shown_with_explicit_display_not_empty_string(self):
+        # Regression guard: #pending-review-section defaults to
+        # `display: none` in the stylesheet (hidden until proven
+        # non-empty). Setting the inline style back to '' only clears an
+        # override -- it does NOT defeat that stylesheet rule, so the
+        # section would stay invisible forever even with entries present.
+        # renderPendingReview() must set an explicit visible value.
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        html = self._render()
+        self.assertIn("entries.length ? 'block' : 'none'", html)
 
 
 class TestRunScanMarkup(unittest.TestCase):
