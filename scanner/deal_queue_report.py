@@ -446,6 +446,7 @@ _HTML_STYLE = """<style>
   --unsupported: #9d174d; --unsupported-bg: #fce7f0;
   --accent: #2563eb; --warn: #b45309; --warn-bg: #fef3e2;
   --legacy: #0e7490; --legacy-bg: #e5f6fa;
+  --lead: #1d4ed8; --lead-bg: #e0e7ff;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-variant-numeric: tabular-nums; }
@@ -530,7 +531,9 @@ main { max-width: 1180px; margin: 0 auto; padding: 18px 16px 60px; }
 .pill-pass { background: var(--pass-bg); color: var(--pass); }
 .pill-unsupported { background: var(--unsupported-bg); color: var(--unsupported); }
 .pill-legacy { background: var(--legacy-bg); color: var(--legacy); }
+.pill-auction-lead { background: var(--lead-bg); color: var(--lead); }
 .score { font-size: 12px; color: var(--muted); }
+.auction-lead-note { font-size: 11.5px; color: var(--muted); margin-top: 4px; line-height: 1.4; max-width: 480px; }
 .confidence-chip { font-size: 12px; color: var(--muted); }
 .confidence-chip::before { content: "·"; margin-right: 8px; color: var(--mutedest); }
 .title { font-size: 14.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 520px; }
@@ -1023,17 +1026,52 @@ _HTML_SCRIPT = r"""<script>
     return out;
   }
 
+  // Auction-lead classification (Pending Review only): an entry is an
+  // "auction lead" -- a relevant Thorntons/Mainland Auctions auction-EVENT
+  // page discovery couldn't resolve to an individual lot -- only when it
+  // matches the exact signal scanner/discover.py's
+  // _build_unverified_watch_opportunity() already encodes (see
+  // scanner/listing_verification.py's _UNSUPPORTED_REASONS docstring):
+  // source is Thorntons or Mainland Auctions AND verification_status is
+  // "unsupported". Deliberately narrower than "verification_status !==
+  // 'verified'" alone -- Trade Me candidates carry that same status for a
+  // structurally different reason (a real single-item listing that
+  // robots.txt blocks re-fetching, not a missing lot) and must keep
+  // rendering as a normal WATCH item, not be relabelled as a lead.
+  var AUCTION_LEAD_SOURCES = { 'Thorntons': true, 'Mainland Auctions': true };
+  function isPendingReviewAuctionLead(entry) {
+    return !!(entry && AUCTION_LEAD_SOURCES[entry.source] && entry.verification_status === 'unsupported');
+  }
+
   function pendingReviewRow(entry) {
     var priceVal = (entry.current_price !== null && entry.current_price !== undefined) ? entry.current_price : entry.buy_now_price;
-    var scoreLine = (entry.flip_score === null || entry.flip_score === undefined) ? 'Not available' : entry.flip_score + '/100';
+    var isLead = isPendingReviewAuctionLead(entry);
+    var headPill = isLead
+      ? '<span class="pill pill-auction-lead">AUCTION LEAD</span>'
+      : '<span class="pill pill-watch">WATCH</span>';
+    // An auction lead never went through product identification or
+    // valuation (see isPendingReviewAuctionLead above) -- flip_score is
+    // structurally absent for it, not "not yet available" the way a real
+    // WATCH item's could be, so no score chip is rendered at all rather
+    // than a "Not available" that would read as a failed valuation. A
+    // non-lead entry's score line is unchanged from before.
+    var scoreSpan = '';
+    if (!isLead) {
+      var scoreLine = (entry.flip_score === null || entry.flip_score === undefined) ? 'Not available' : entry.flip_score + '/100';
+      scoreSpan = '<span class="score">' + escapeHtml(scoreLine) + '</span>';
+    }
+    var leadNote = isLead
+      ? '<div class="auction-lead-note">Manual lot review required &mdash; individual lots inside this auction have not yet been identified or valued. Open the listing to review lots yourself.</div>'
+      : '';
     var foundLine = entry.found_at ? new Date(entry.found_at).toLocaleDateString() : 'unknown date';
     var rowHtml =
       '<div class="row-main">' +
       '<div class="row-left">' +
-      '<div class="row-head"><span class="pill pill-watch">WATCH</span><span class="score">' + escapeHtml(scoreLine) + '</span></div>' +
+      '<div class="row-head">' + headPill + scoreSpan + '</div>' +
       '<div class="title">' + escapeHtml(entry.title || '(untitled)') + '</div>' +
       '<div class="source">' + escapeHtml(entry.source || 'Unknown source') + ' &middot; found ' + foundLine +
       ' &middot; <a href="' + escapeAttr(entry.url) + '" target="_blank" rel="noopener">Open listing &#8599;</a></div>' +
+      leadNote +
       '</div>' +
       '<div class="row-right">' +
       '<div class="price-line"><span class="price-block"><span class="price-figure">' + money(priceVal) + '</span><span class="price-label">Asking</span></span></div>' +

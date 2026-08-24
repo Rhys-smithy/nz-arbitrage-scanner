@@ -1025,6 +1025,125 @@ class TestRenderLatestDealQueueWithPendingReview(unittest.TestCase):
         html = self._render()
         self.assertIn("entries.length ? 'block' : 'none'", html)
 
+    def test_html_includes_auction_lead_classification_logic(self):
+        # 2026-08-24 auction-lead recommendation: Pending Review must be
+        # able to tell an auction-EVENT page apart from a real product
+        # WATCH item, using exactly the signal scanner/discover.py's
+        # _build_unverified_watch_opportunity() already encodes -- source
+        # is Thorntons/Mainland Auctions AND verification_status is
+        # "unsupported" -- not the broader "verification_status !==
+        # 'verified'" (which also matches unrelated Trade Me candidates).
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        html = self._render()
+        self.assertIn("isPendingReviewAuctionLead", html)
+        self.assertIn("'Thorntons': true, 'Mainland Auctions': true", html)
+        self.assertIn("entry.verification_status === 'unsupported'", html)
+
+    def test_html_shows_auction_lead_pill_and_manual_review_copy(self):
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        html = self._render()
+        self.assertIn('pill-auction-lead">AUCTION LEAD<', html)
+        self.assertIn("Manual lot review required", html)
+        self.assertIn("individual lots inside this auction have not yet been identified or valued", html)
+
+    def test_html_does_not_render_not_available_score_for_auction_leads(self):
+        # The whole point of the fix: an auction lead must never show a
+        # "Not available" score line (which reads as a failed valuation)
+        # -- it renders no score chip at all for a lead, only the
+        # explanatory note. This is a template-logic assertion (isLead
+        # gates the score span in pendingReviewRow()), since the embedded
+        # snapshot itself is data, not the conditional rendering.
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        html = self._render()
+        self.assertIn("if (!isLead) {", html)
+        self.assertIn('scoreSpan = \'<span class="score">\' + escapeHtml(scoreLine) + \'</span>\';', html)
+
+    def test_pursue_reject_workflow_unchanged_for_auction_leads(self):
+        # Pursue/Reject must remain identical regardless of classification
+        # -- the auction-lead pill/copy is presentation-only and must not
+        # branch the action wiring.
+        self._persist_run([_opportunity(decision="WATCH")], decision_counts={"WATCH": 1})
+        html = self._render()
+        self.assertIn("pending-review-btn pursue", html)
+        self.assertIn("pending-review-btn reject", html)
+        self.assertIn("resolvePendingReview(entry, 'pursue')", html)
+        self.assertIn("resolvePendingReview(entry, 'reject')", html)
+
+
+class TestPendingReviewAuctionLeadClassificationRule(unittest.TestCase):
+    """Unit-level regression coverage for the exact classification rule
+    (source in {Thorntons, Mainland Auctions} AND verification_status ==
+    'unsupported') as it's persisted by scanner/pending_review_store.py's
+    sync_new_watch_opportunities() -- i.e. that the *data* an auction-lead
+    entry carries is exactly what the dashboard's isPendingReviewAuctionLead()
+    branches on, and that a Trade Me (or any other) unsupported candidate is
+    never given that same signal.
+
+    This intentionally does not import any JS -- it verifies the Python
+    side of the contract (what pending_review_store persists) so a future
+    change to sync_new_watch_opportunities() that dropped/renamed `source`
+    or `verification_status` would be caught here, independent of the HTML
+    rendering tests above."""
+
+    def _watch_opportunity(self, source, verification_status, url):
+        return Opportunity(
+            title=f"{source} auction lead",
+            url=url,
+            source=source,
+            current_price=None,
+            verification_status=verification_status,
+            decision="WATCH",
+        )
+
+    def test_thorntons_unsupported_watch_carries_the_auction_lead_signal(self):
+        state = {}
+        sync_new_watch_opportunities(
+            state,
+            [self._watch_opportunity("Thorntons", "unsupported", "https://www.thorntons.net.nz/auctions/detail/bw133195")],
+        )
+        entry = list(state.values())[0]
+        self.assertEqual(entry["source"], "Thorntons")
+        self.assertEqual(entry["verification_status"], "unsupported")
+
+    def test_mainland_auctions_unsupported_watch_carries_the_auction_lead_signal(self):
+        state = {}
+        sync_new_watch_opportunities(
+            state,
+            [self._watch_opportunity("Mainland Auctions", "unsupported", "https://www.mainlandauctions.nz/auctions/some-event")],
+        )
+        entry = list(state.values())[0]
+        self.assertEqual(entry["source"], "Mainland Auctions")
+        self.assertEqual(entry["verification_status"], "unsupported")
+
+    def test_trade_me_unsupported_watch_does_not_carry_the_auction_lead_signal(self):
+        # Trade Me candidates are also "unsupported" (robots.txt blocks
+        # re-verification) but are real single-item listings, not
+        # auction-event pages -- the persisted entry's source must stay
+        # "Trade Me" so isPendingReviewAuctionLead()'s source allowlist
+        # (which does not include Trade Me) correctly excludes it.
+        state = {}
+        sync_new_watch_opportunities(
+            state,
+            [self._watch_opportunity("Trade Me", "unsupported", "https://www.trademe.co.nz/listing/1234567")],
+        )
+        entry = list(state.values())[0]
+        self.assertEqual(entry["source"], "Trade Me")
+        self.assertEqual(entry["verification_status"], "unsupported")
+        self.assertNotIn(entry["source"], ("Thorntons", "Mainland Auctions"))
+
+    def test_verified_turners_watch_does_not_carry_the_auction_lead_signal(self):
+        # A verified (real product) WATCH item must never satisfy the
+        # auction-lead rule either, even hypothetically -- guards against
+        # a future regression that widens the rule to ignore
+        # verification_status entirely.
+        state = {}
+        sync_new_watch_opportunities(
+            state,
+            [self._watch_opportunity("Turners", "verified", "https://www.turners.co.nz/General-Goods/Search/electronics/cameras/12345/")],
+        )
+        entry = list(state.values())[0]
+        self.assertEqual(entry["verification_status"], "verified")
+
 
 class TestRunScanMarkup(unittest.TestCase):
     """Command Centre "Run Scan" control + live-progress panel. Like
