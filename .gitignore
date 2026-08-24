@@ -4,6 +4,7 @@ data/seen.json
 data/discovered.json
 data/search_stats.json
 data/scan_progress.json
+data/scan.lock
 reports/*.csv
 
 # If you fill in real keys in config.json for local use, uncomment this
