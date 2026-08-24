@@ -11,7 +11,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest import mock
 
-from scanner import dashboard_server, scan_progress
+from scanner import dashboard_server, scan_lock, scan_progress
 
 
 class _FakeProcess:
@@ -74,6 +74,18 @@ class DashboardServerScanEndpointsTest(unittest.TestCase):
                 self._backup = f.read()
             os.remove(self._real_path)
 
+        # scan_lock.DEFAULT_PATH is real, shared, cross-process state too
+        # (see scanner/scan_lock.py) -- same backup/restore treatment as
+        # scan_progress's file above, for the same reason: these tests must
+        # never leave a stray lock file behind (which would wedge every
+        # future real scan) or clobber one a real scan already holds.
+        self._real_lock_path = scan_lock.DEFAULT_PATH
+        self._lock_backup = None
+        if os.path.exists(self._real_lock_path):
+            with open(self._real_lock_path, encoding="utf-8") as f:
+                self._lock_backup = f.read()
+            os.remove(self._real_lock_path)
+
         # Reset dashboard_server's module-level scan-tracking state so
         # tests never leak a "running" process into one another.
         dashboard_server._scan_process = None
@@ -89,6 +101,12 @@ class DashboardServerScanEndpointsTest(unittest.TestCase):
         if self._backup is not None:
             with open(self._real_path, "w", encoding="utf-8") as f:
                 f.write(self._backup)
+
+        if os.path.exists(self._real_lock_path):
+            os.remove(self._real_lock_path)
+        if self._lock_backup is not None:
+            with open(self._real_lock_path, "w", encoding="utf-8") as f:
+                f.write(self._lock_backup)
 
     def _url(self, path):
         return f"http://127.0.0.1:{self.port}{path}"
@@ -146,6 +164,37 @@ class DashboardServerScanEndpointsTest(unittest.TestCase):
         # not have started a second one.
         self.mock_spawn.assert_called_once()
 
+        fake.finish(0)
+
+    def test_second_start_rejected_when_cross_process_lock_is_held(self):
+        # Regression guard for the "results appear then revert" / duplicate
+        # opportunities bug: this server's own in-process _scan_process
+        # tracking has no idea a `python main.py --mode discover` process
+        # is running -- e.g. left over from before this server was
+        # restarted, or started by hand in another terminal -- unless it
+        # also checks the cross-process lock file scan_lock.py introduces.
+        # Simulates exactly that: _scan_process is None (as if freshly
+        # (re)started) but the lock is genuinely held by someone else.
+        self.assertTrue(scan_lock.acquire(self._real_lock_path))
+        self.assertIsNone(dashboard_server._scan_process)
+
+        status, body = self._post("/api/scan/start")
+
+        self.assertEqual(status, 409)
+        self.mock_spawn.assert_not_called()
+
+    def test_start_succeeds_once_the_cross_process_lock_is_released(self):
+        scan_lock.acquire(self._real_lock_path)
+        status1, _ = self._post("/api/scan/start")
+        self.assertEqual(status1, 409)
+
+        scan_lock.release(self._real_lock_path)
+        fake = _FakeProcess()
+        self.mock_spawn.return_value = fake
+        status2, body2 = self._post("/api/scan/start")
+
+        self.assertEqual(status2, 200)
+        self.assertTrue(body2["started"])
         fake.finish(0)
 
     def test_start_succeeds_again_once_previous_scan_finished(self):
