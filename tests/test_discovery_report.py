@@ -180,6 +180,24 @@ class TestWriteDiscoveryReport(unittest.TestCase):
         self.assertTrue(basename.endswith(".json"))
         self.assertNotIn("opportunities_", basename)  # never collide with the legacy CSV/XLSX naming
 
+    def test_filename_includes_seconds_so_two_runs_in_the_same_minute_do_not_collide(self):
+        # Regression guard: this filename used to be minute-granularity
+        # only (discovery_%Y%m%d_%H%M.json). Reproduced directly: two real
+        # discover-mode runs finishing ~8s apart landed on the exact same
+        # filename, and the second run's write silently overwrote the
+        # first's -- discovery_index.json was left with two entries
+        # (different opportunity_count/decision_counts) both pointing at
+        # the one file that now only held the second run's data. Seconds
+        # granularity (combined with scanner/scan_lock.py, which now
+        # prevents two discover-mode runs from overlapping in time at all)
+        # closes this.
+        path, _ = write_discovery_report([], _run_meta(), reports_dir=self.tmpdir.name)
+        basename = os.path.basename(path)
+        # discovery_YYYYMMDD_HHMMSS.json -- the timestamp segment after the
+        # second underscore must be 6 digits (HHMMSS), not 4 (HHMM).
+        timestamp_segment = basename[len("discovery_"):-len(".json")].split("_")[1]
+        self.assertEqual(len(timestamp_segment), 6, basename)
+
 
 class TestUpdateDiscoveryIndex(unittest.TestCase):
     def setUp(self):

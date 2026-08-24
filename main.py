@@ -28,10 +28,11 @@ schedule it -- see README.md for GitHub Actions or Windows Task Scheduler.
 import argparse
 import json
 import os
+import sys
 import time
 from collections import Counter
 
-from scanner import scan_progress
+from scanner import scan_lock, scan_progress
 from scanner.scrapers import SCRAPERS
 from scanner.scrapers.turners_catalog import fetch_all_categories as fetch_turners_category
 from scanner.scrapers.turners_vehicles import fetch_all_divisions as fetch_turners_vehicles
@@ -297,48 +298,77 @@ def main():
         from scanner.deal_queue_report import render_latest_deal_queue
         from scanner.discover import print_top_opportunities, run_discovery, send_discovery_alerts
 
-        # main.py (not scanner/discover.py) owns the overall scan lifecycle
-        # for the Command Centre's "Run Scan" live-progress feature:
-        # start_progress() here, before anything else, so
-        # GET /api/scan/status has something real to show from the moment
-        # this process starts, even if config-loading or run_discovery()
-        # itself fails immediately. run_discovery() only reports the real
-        # SEARCH/VALIDATION/RESEARCH progress *within* an already-started
-        # run (see its own docstring) -- it never marks completion, because
-        # "the scan pipeline finished" and "the dashboard has something new
-        # to show" are two different moments: the Deal Queue view isn't
-        # regenerated until render_latest_deal_queue() below runs.
-        scan_progress.start_progress()
+        # Cross-process guard: nothing about dashboard_server.py's own
+        # "Run Scan" click handling (its in-process _scan_lock/_scan_process
+        # pair) protects against a SECOND, independently-started
+        # `python main.py --mode discover` process -- e.g. one left running
+        # after the dashboard server that spawned it was restarted (its
+        # subprocess is never killed just because the server exited), or
+        # one started by hand in another terminal. Two such processes
+        # racing to write the same data/scan_progress.json,
+        # reports/discovery_index.json, and reports/deal_queue.html is
+        # exactly how a scan's correct, freshly-shown results get silently
+        # replaced by an unrelated second run's a few seconds later --
+        # reproduced directly; see scanner/scan_lock.py's module docstring
+        # for the full failure sequence. Acquired BEFORE start_progress()
+        # so a rejected second run never touches (and can never corrupt)
+        # the genuinely-running first run's live progress display.
+        if not scan_lock.acquire():
+            print(
+                "[main] another discovery scan is already running (scan.lock is held) -- "
+                "refusing to start a second one. If you're sure nothing is actually running "
+                "(e.g. after a crash), delete data/scan.lock."
+            )
+            sys.exit(1)
+
         try:
-            opportunities = run_discovery(config)
+            # main.py (not scanner/discover.py) owns the overall scan
+            # lifecycle for the Command Centre's "Run Scan" live-progress
+            # feature: start_progress() here, before anything else, so
+            # GET /api/scan/status has something real to show from the
+            # moment this process starts, even if config-loading or
+            # run_discovery() itself fails immediately. run_discovery()
+            # only reports the real SEARCH/VALIDATION/RESEARCH progress
+            # *within* an already-started run (see its own docstring) -- it
+            # never marks completion, because "the scan pipeline finished"
+            # and "the dashboard has something new to show" are two
+            # different moments: the Deal Queue view isn't regenerated
+            # until render_latest_deal_queue() below runs.
+            scan_progress.start_progress()
+            try:
+                opportunities = run_discovery(config)
 
-            # run_discovery() already persisted this run's Opportunity
-            # results (scanner/discovery_report.py) regardless of whether
-            # any were found -- regenerate the Deal Queue view from that
-            # same persisted data so it always reflects the latest run,
-            # including a 0-result run. Read-only over already-written
-            # files; never recomputes. This is also why COMPLETE is marked
-            # after this call, not right after run_discovery() returns --
-            # the dashboard's auto-refresh-on-completion behaviour depends
-            # on deal_queue.html already reflecting this run by the time it
-            # sees stage=COMPLETE.
-            deal_queue_path = render_latest_deal_queue()
-            if deal_queue_path:
-                print(f"[main] wrote deal queue view to {deal_queue_path}")
-        except Exception as e:
-            # Preserves whatever SEARCH/VALIDATION/RESEARCH progress
-            # run_discovery() already recorded (fail_progress() only
-            # patches running/stage/error/completed_at -- see
-            # scanner/scan_progress.py) rather than resetting to a blank
-            # slate, then re-raises so this still exits non-zero (the
-            # subprocess-exit-code safety net in
-            # scanner/dashboard_server.py is a second, independent layer
-            # for failures severe enough that even this except block never
-            # runs, e.g. the interpreter being killed outright).
-            scan_progress.fail_progress(f"Discovery scan failed: {e}")
-            raise
+                # run_discovery() already persisted this run's Opportunity
+                # results (scanner/discovery_report.py) regardless of
+                # whether any were found -- regenerate the Deal Queue view
+                # from that same persisted data so it always reflects the
+                # latest run, including a 0-result run. Read-only over
+                # already-written files; never recomputes. This is also why
+                # COMPLETE is marked after this call, not right after
+                # run_discovery() returns -- the dashboard's
+                # auto-refresh-on-completion behaviour depends on
+                # deal_queue.html already reflecting this run by the time
+                # it sees stage=COMPLETE.
+                deal_queue_path = render_latest_deal_queue()
+                if deal_queue_path:
+                    print(f"[main] wrote deal queue view to {deal_queue_path}")
+            except Exception as e:
+                # Preserves whatever SEARCH/VALIDATION/RESEARCH progress
+                # run_discovery() already recorded (fail_progress() only
+                # patches running/stage/error/completed_at -- see
+                # scanner/scan_progress.py) rather than resetting to a
+                # blank slate, then re-raises so this still exits non-zero
+                # (the subprocess-exit-code safety net in
+                # scanner/dashboard_server.py is a second, independent
+                # layer for failures severe enough that even this except
+                # block never runs, e.g. the interpreter being killed
+                # outright).
+                scan_progress.fail_progress(f"Discovery scan failed: {e}")
+                raise
 
-        scan_progress.complete_progress(dict(Counter(o.decision for o in opportunities)))
+            scan_progress.complete_progress(dict(Counter(o.decision for o in opportunities)))
+        finally:
+            scan_lock.release()
 
         if not opportunities:
             print("[main] discovery mode found no opportunities this run.")

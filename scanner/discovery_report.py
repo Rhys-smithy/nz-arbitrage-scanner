@@ -69,7 +69,16 @@ def write_discovery_report(
     }
 
     os.makedirs(reports_dir, exist_ok=True)
-    filename = f"discovery_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+    # Seconds granularity (not just %Y%m%d_%H%M): two runs finishing in the
+    # same clock minute -- e.g. back-to-back manual "Run Scan" clicks, or
+    # (before scanner/scan_lock.py) two concurrent discover-mode processes
+    # -- previously collided on this exact filename, and the second run's
+    # write silently overwrote the first's, corrupting the persisted report
+    # discovery_index.json still had an entry pointing at (reproduced
+    # directly: two runs both wrote discovery_20260824_0909.json, and the
+    # index kept a stale entry describing the first run's opportunity count
+    # against a file that now actually held the second run's data).
+    filename = f"discovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     path = os.path.join(reports_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)

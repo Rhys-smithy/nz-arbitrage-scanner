@@ -85,6 +85,20 @@ next regenerates the HTML. See ``scanner/dashboard_server.py`` for the
 local process that serves this same JSON live, and this page's own
 client-side JS for how it upgrades from "read the embedded snapshot" to
 "fetch the live state" when that server happens to be running.
+
+Known limitation: cross-pipeline duplicates (not fixed here)
+--------------------------------------------------------------
+Discovery and the legacy Daily Scan independently scrape the same
+Turners categories (scanner/search/auction_search.py reuses the legacy
+pipeline's own scrapers), so the same physical listing can legitimately
+be persisted by both and renders as two separate, unrelated-looking
+rows/cards with no indication they're the same real item. This was
+investigated (see the project's own notes, 2026-08-24) and confirmed to
+be a genuine data-model/aggregation question -- not something this
+presentation-only module should silently patch by hiding, merging, or
+annotating one pipeline's persisted record based on a render-time-only
+identity match. Deliberately deferred to a separate task rather than
+fixed here.
 """
 from __future__ import annotations
 
