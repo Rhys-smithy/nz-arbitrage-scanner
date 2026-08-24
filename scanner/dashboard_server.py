@@ -78,7 +78,7 @@ from scanner.hunting_store import (
     update_notes,
     update_target_offer,
 )
-from scanner import scan_progress
+from scanner import scan_lock, scan_progress
 
 REPORTS_DIR = os.path.join(os.path.dirname(__file__), "..", "reports")
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -152,6 +152,17 @@ def start_scan() -> bool:
     global _scan_process
     with _scan_lock:
         if _scan_process is not None and _scan_process.poll() is None:
+            return False
+        if scan_lock.is_held():
+            # A `python main.py --mode discover` process is running that
+            # this server didn't spawn (or spawned before it was last
+            # restarted -- its subprocess outlives the restart) -- see
+            # scanner/scan_lock.py. Refuse to spawn a second one rather
+            # than letting two scans race over the same
+            # data/scan_progress.json / reports/discovery_index.json /
+            # reports/deal_queue.html; main.py itself enforces this too
+            # (the authoritative check), this is just an earlier, clearer
+            # rejection than waiting for that subprocess to fail.
             return False
         _scan_process = _spawn_scan_process()
         proc = _scan_process
