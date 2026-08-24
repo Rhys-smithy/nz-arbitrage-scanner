@@ -86,18 +86,19 @@ local process that serves this same JSON live, and this page's own
 client-side JS for how it upgrades from "read the embedded snapshot" to
 "fetch the live state" when that server happens to be running.
 
-Cross-pipeline overlap note (not a merge/dedup)
-------------------------------------------------
+Known limitation: cross-pipeline duplicates (not fixed here)
+--------------------------------------------------------------
 Discovery and the legacy Daily Scan independently scrape the same
 Turners categories (scanner/search/auction_search.py reuses the legacy
-pipeline's own scrapers), so the same physical listing can legitimately be
-persisted by both and would otherwise render as two unrelated-looking
-rows. The client-side JS computes each row's source+canonical-URL identity
-(the same key scanner.hunting_store.make_key() uses) and, when that key
-exists in both payloads, adds a small "same listing also found by ..."
-note to both rows. This is display-only -- it never removes, hides, or
-merges either pipeline's persisted record; each row keeps its own native
-fields exactly as loaded.
+pipeline's own scrapers), so the same physical listing can legitimately
+be persisted by both and renders as two separate, unrelated-looking
+rows/cards with no indication they're the same real item. This was
+investigated (see the project's own notes, 2026-08-24) and confirmed to
+be a genuine data-model/aggregation question -- not something this
+presentation-only module should silently patch by hiding, merging, or
+annotating one pipeline's persisted record based on a render-time-only
+identity match. Deliberately deferred to a separate task rather than
+fixed here.
 """
 from __future__ import annotations
 
@@ -506,7 +507,6 @@ main { max-width: 1180px; margin: 0 auto; padding: 18px 16px 60px; }
 .confidence-chip::before { content: "·"; margin-right: 8px; color: var(--mutedest); }
 .title { font-size: 14.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 520px; }
 .source { font-size: 12px; color: var(--mutedest); }
-.cross-pipeline-note { font-size: 11px; color: var(--warn); margin-top: 3px; }
 .row-right { text-align: right; flex-shrink: 0; }
 .price-line { display: flex; align-items: baseline; justify-content: flex-end; gap: 8px; }
 .price-block { display: inline-flex; flex-direction: column; align-items: flex-end; line-height: 1.15; }
@@ -888,37 +888,6 @@ _HTML_SCRIPT = r"""<script>
     var n = 0;
     items.forEach(function (it) { if (isHunted(it)) n++; });
     return n;
-  }
-
-  // ---- Cross-pipeline overlap: Turners is scraped independently by BOTH
-  // the legacy Daily Scan pipeline (main.py) and the Discovery pipeline
-  // (main.py --mode discover -- scanner/search/auction_search.py reuses
-  // the exact same Turners scrapers and the exact same
-  // config.json:turners_categories list). Nothing reconciles the two, so
-  // the SAME physical listing, found by both, is persisted and rendered
-  // as two separate rows with no shared identity -- confirmed against real
-  // persisted data (the same Turners URL appeared in both a day's legacy
-  // CSV and that same day's discovery JSON, 3 minutes apart) and by
-  // running both pipelines close together directly.
-  //
-  // This does NOT merge or hide either record -- each pipeline's own data
-  // stays exactly as persisted, unchanged, per this module's own docstring
-  // on why the two are deliberately never forced into one schema. It only
-  // tells the reader, honestly, that a row is the same real listing as
-  // another row elsewhere on the page, using the exact same source +
-  // canonical-URL identity the Hunting feature already established
-  // (huntingKey() above) -- not a new or different notion of "same item".
-  var crossPipelineCounts = {};
-  items.forEach(function (it) {
-    var k = huntingKey(it);
-    if (!crossPipelineCounts[k]) crossPipelineCounts[k] = { discovery: 0, legacy: 0 };
-    crossPipelineCounts[k][it.pipeline]++;
-  });
-  function crossPipelineOther(it) {
-    var counts = crossPipelineCounts[huntingKey(it)];
-    if (!counts) return null;
-    var otherPipeline = it.pipeline === 'discovery' ? 'legacy' : 'discovery';
-    return counts[otherPipeline] > 0 ? otherPipeline : null;
   }
 
   function postJson(path, payload) {
@@ -1487,13 +1456,6 @@ _HTML_SCRIPT = r"""<script>
     var noEvidenceFlag = (it.pipeline === 'discovery' && (!it.raw.valuation || !(it.raw.valuation.evidence || []).length))
       ? '<div class="no-evidence-flag">No comparable evidence</div>' : '';
 
-    var otherPipeline = crossPipelineOther(it);
-    var crossPipelineNote = otherPipeline
-      ? '<div class="cross-pipeline-note">Same listing also found by ' +
-        (otherPipeline === 'legacy' ? 'Daily Scan' : 'Discovery') +
-        ' &mdash; not a separate opportunity.</div>'
-      : '';
-
     var maxBuy = it.pipeline === 'discovery' ? money(it.raw.max_buy_price) : 'Not available';
     var hunted = isHunted(it);
     var starTitle = hunted ? 'Stop hunting (unstar)' : 'Star: keep tracking this opportunity';
@@ -1509,7 +1471,6 @@ _HTML_SCRIPT = r"""<script>
       '</div>' +
       '<div class="title">' + escapeHtml(title(it)) + '</div>' +
       '<div class="source">' + escapeHtml(source(it)) + (category(it) ? ' &middot; ' + escapeHtml(category(it)) : '') + ' &middot; ' + escapeHtml(eq.label) + '</div>' +
-      crossPipelineNote +
       '</div>' +
       '<div class="row-right">' +
       '<div class="price-line">' +
