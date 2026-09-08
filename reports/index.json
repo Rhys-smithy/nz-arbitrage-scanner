@@ -1,7 +1,13 @@
 {
-  "generated_at": "2026-09-07T21:09:50Z",
-  "count": 44,
+  "generated_at": "2026-09-08T20:44:32Z",
+  "count": 45,
   "reports": [
+    {
+      "csv": "opportunities_20260908_2041.csv",
+      "xlsx": "opportunities_20260908_2041.xlsx",
+      "timestamp": "2026-09-08T20:41",
+      "rows": 5
+    },
     {
       "csv": "opportunities_20260907_2106.csv",
       "xlsx": "opportunities_20260907_2106.xlsx",
