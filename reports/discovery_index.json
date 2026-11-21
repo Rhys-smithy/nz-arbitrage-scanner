@@ -1,7 +1,16 @@
 {
-  "generated_at": "2026-11-20T23:43:26+00:00",
-  "count": 100,
+  "generated_at": "2026-11-21T22:49:26+00:00",
+  "count": 101,
   "reports": [
+    {
+      "json": "discovery_20261121_224926.json",
+      "run_timestamp": "2026-11-21T22:49:26+00:00",
+      "opportunity_count": 65,
+      "decision_counts": {
+        "PASS": 5,
+        "WATCH": 60
+      }
+    },
     {
       "json": "discovery_20261120_234326.json",
       "run_timestamp": "2026-11-20T23:43:26+00:00",
