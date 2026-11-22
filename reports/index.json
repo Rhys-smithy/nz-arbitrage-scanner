@@ -1,7 +1,13 @@
 {
-  "generated_at": "2026-11-21T22:49:26Z",
+  "generated_at": "2026-11-22T23:14:11Z",
   "count": 60,
   "reports": [
+    {
+      "csv": "opportunities_20261122_2312.csv",
+      "xlsx": "opportunities_20261122_2312.xlsx",
+      "timestamp": "2026-11-22T23:12",
+      "rows": 4
+    },
     {
       "csv": "opportunities_20261121_2247.csv",
       "xlsx": "opportunities_20261121_2247.xlsx",
@@ -355,12 +361,6 @@
       "xlsx": "opportunities_20260922_2053.xlsx",
       "timestamp": "2026-09-22T20:53",
       "rows": 7
-    },
-    {
-      "csv": "opportunities_20260921_2141.csv",
-      "xlsx": "opportunities_20260921_2141.xlsx",
-      "timestamp": "2026-09-21T21:41",
-      "rows": 15
     }
   ]
 }
